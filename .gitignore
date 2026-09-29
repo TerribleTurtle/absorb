@@ -87,3 +87,42 @@ packages/whisper_ggml_plus/pubspec.lock
 
 # Kotlin build session caches
 **/android/.kotlin/
+
+# AI Coding Assistants & Agent Memory
+# Anthropic Claude Code
+.claude/
+.claude.json
+CLAUDE.md
+CLAUDE_*.md
+
+# Google Antigravity & Gemini CLI
+.gemini/
+GEMINI.md
+.antigravity/
+
+# Cursor / Windsurf / Codeium / Copilot / Aider / Continue
+.cursor/
+.cursorrules
+.cursorindexing/
+.cursorignore
+.windsurf/
+.codeium/
+.copilot/
+.openai/
+.aider*
+.cline/
+.roo/
+.roomodes
+.devin/
+.continue/
+.aichat/
+
+# Agent Memory System & Disk Brain (Context Engineering)
+task_plan.md
+findings.md
+findings_*.md
+progress.md
+KNOWN_ISSUES.md
+AGENTS.md
+scratch/
+
