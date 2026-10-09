@@ -230,16 +230,6 @@ class PlayerSettings {
     await prefs.setInt('transcriptionWindowSeconds', value);
   }
 
-  /// Replace a bookmark transcript with the ebook's exact text when a
-  /// confident match is found (only offered when the book has an EPUB).
-  static Future<bool> getTranscriptionUseEbookText() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool('transcriptionUseEbookText') ?? true;
-  }
-  static Future<void> setTranscriptionUseEbookText(bool value) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('transcriptionUseEbookText', value);
-  }
 
   /// Live transcript overlay: line font size and how many lines may wrap.
   static Future<double> getLyricsFontSize() async {
@@ -517,10 +507,12 @@ class PlayerSettings {
     final value = await ScopedPrefs.getString('bookQueueMode');
     return value ?? await getQueueMode();
   }
-  static Future<void> setBookQueueMode(String value) =>
-      _serializeQueueModeMutation(
-        () => _set('bookQueueMode', value, notify: true),
-      );
+  static Future<void> setBookQueueMode(String value) {
+    debugPrint('[Queue] Book queue mode -> $value');
+    return _serializeQueueModeMutation(
+      () => _set('bookQueueMode', value, notify: true),
+    );
+  }
 
   static Future<bool> getShowUpNextLabel() => _get('showUpNextLabel', true);
   static Future<void> setShowUpNextLabel(bool value) =>
@@ -530,10 +522,12 @@ class PlayerSettings {
     final value = await ScopedPrefs.getString('podcastQueueMode');
     return value ?? await getQueueMode();
   }
-  static Future<void> setPodcastQueueMode(String value) =>
-      _serializeQueueModeMutation(
-        () => _set('podcastQueueMode', value, notify: true),
-      );
+  static Future<void> setPodcastQueueMode(String value) {
+    debugPrint('[Queue] Podcast queue mode -> $value');
+    return _serializeQueueModeMutation(
+      () => _set('podcastQueueMode', value, notify: true),
+    );
+  }
 
   /// Per-show podcast auto-advance direction: 'oldest_first' (default) or
   /// 'newest_first'. Stored under a raw (un-scoped) key because the advance
@@ -821,6 +815,13 @@ class PlayerSettings {
     await _set('showExplicitBadge', value);
   }
 
+  static bool showEbookBadge = true;
+  static Future<bool> getShowEbookBadge() => _get('showEbookBadge', true);
+  static Future<void> setShowEbookBadge(bool value) async {
+    showEbookBadge = value;
+    await _set('showEbookBadge', value, notify: true);
+  }
+
   /// Cached value for synchronous access when building audio sources.
   static bool mp3IndexSeeking = false;
   static Future<bool> getMp3IndexSeeking() => _get('mp3IndexSeeking', false);
@@ -849,6 +850,27 @@ class PlayerSettings {
   // alive but paused) belongs to the car system's own resume behavior; this
   // covers the cold start where no session exists for it to resume.
   static Future<bool> getAutoplayOnCarConnect() => _get('autoplayOnCarConnect', false);
+  static Future<bool> getKeepScreenOnInPlayer() => _get('keepScreenOnPlayer', false);
+  static Future<void> setKeepScreenOnInPlayer(bool value) =>
+      _set('keepScreenOnPlayer', value, notify: true);
+  static Future<bool> getKeepScreenOnInCarMode() => _get('keepScreenOnCarMode', false);
+  static Future<void> setKeepScreenOnInCarMode(bool value) =>
+      _set('keepScreenOnCarMode', value, notify: true);
+
+  // Android Auto / CarPlay library browsing. Book sort is 'title', 'author' or
+  // 'added' (newest first); reverse flips whichever is picked. Podcast shows
+  // sort 'title' or 'added'.
+  static Future<String> getCarBookSort() => _get('carBookSort', 'title');
+  static Future<void> setCarBookSort(String value) => _set('carBookSort', value);
+  static Future<bool> getCarBookSortReverse() => _get('carBookSortReverse', false);
+  static Future<void> setCarBookSortReverse(bool value) =>
+      _set('carBookSortReverse', value);
+  static Future<String> getCarPodcastSort() => _get('carPodcastSort', 'title');
+  static Future<void> setCarPodcastSort(String value) => _set('carPodcastSort', value);
+  static Future<bool> getCarEpisodesOldestFirst() =>
+      _get('carEpisodesOldestFirst', false);
+  static Future<void> setCarEpisodesOldestFirst(bool value) =>
+      _set('carEpisodesOldestFirst', value);
   static Future<void> setAutoplayOnCarConnect(bool value) =>
       _set('autoplayOnCarConnect', value);
 
@@ -1080,6 +1102,15 @@ class PlayerSettings {
   static Future<bool> getRectangleCovers() => _get('rectangleCovers', false);
   static Future<void> setRectangleCovers(bool value) => _set('rectangleCovers', value, notify: true);
 
+  /// How the player card's buttons are filled: 'clear' (no fill or edge),
+  /// 'subtle' (the long-standing look) or 'solid'. Cached for builders.
+  static String cardButtonFill = 'subtle';
+  static Future<String> getCardButtonFill() => _get('cardButtonFill', 'subtle');
+  static Future<void> setCardButtonFill(String value) async {
+    cardButtonFill = value;
+    await _set('cardButtonFill', value, notify: true);
+  }
+
   /// Cached value for synchronous access in grid builders.
   /// 'small' | 'medium' | 'large'; medium keeps the long-standing layout.
   static String coverSize = 'medium';
@@ -1194,7 +1225,7 @@ class PlayerSettings {
 
   // ── Card button order ──
 
-  static const defaultButtonOrder = ['chapters', 'speed', 'sleep', 'bookmarks', 'details', 'ebook', 'findinebook', 'lyrics', 'equalizer', 'cast', 'airplay', 'history', 'remove', 'car', 'notes', 'download'];
+  static const defaultButtonOrder = ['chapters', 'speed', 'sleep', 'bookmarks', 'details', 'ebook', 'findinebook', 'lyrics', 'equalizer', 'cast', 'airplay', 'history', 'remove', 'car', 'notes', 'wake', 'download'];
 
   static Future<List<String>> getCardButtonOrder() async {
     final stored = await ScopedPrefs.getStringList('card_button_order');

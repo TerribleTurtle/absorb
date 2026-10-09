@@ -430,6 +430,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
 
   Future<void> addToAbsorbingQueue(String itemId,
       {Map<String, dynamic>? item}) async {
+    debugPrint('[Absorbing] Added $itemId to the end (from ${_caller()})');
     _keepInAbsorbing(itemId, item);
     _absorbingIdsAdd(itemId, atFront: false);
     await _saveManualAbsorbing();
@@ -449,6 +450,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         : player.currentEpisodeId == null
             ? player.currentItemId
             : '${player.currentItemId}-${player.currentEpisodeId}';
+    debugPrint('[Absorbing] Added $key to play next (from ${_caller()})');
     _keepInAbsorbing(key, item);
     _absorbingBookIds.remove(key);
     final activeIdx =
@@ -636,7 +638,16 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     if (_manualAbsorbRemoves.remove(key)) _saveManualAbsorbing();
   }
 
+  /// Where a queue change came from, for the log: the frame that called the
+  /// method that called this.
+  static String _caller() {
+    final frames = StackTrace.current.toString().split('\n');
+    if (frames.length < 3) return '?';
+    return frames[2].replaceFirst(RegExp(r'^#\d+\s+'), '').trim();
+  }
+
   Future<void> removeFromAbsorbing(String key) async {
+    debugPrint('[Absorbing] Removed $key (from ${_caller()})');
     _manualAbsorbRemoves.add(key);
     _manualAbsorbAdds.remove(key);
     _finishedManualAbsorbAdds.remove(key);
@@ -651,6 +662,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       {bool skipRefresh = false,
       bool skipAutoAdvance = false,
       bool fromRemote = false}) {
+    debugPrint('[Absorbing] Finished $itemId (remote=$fromRemote '
+        'autoAdvance=${!skipAutoAdvance} playing=${AudioPlayerService().currentItemId})');
     _resetItems.remove(itemId);
     final existing = _progressMap[itemId] ?? {};
     if (itemId.length > 36 && existing['isFinished'] != true) {
@@ -679,7 +692,11 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     notifyListeners();
 
     if (itemId.length <= 36) {
-      _addNextSeriesBookToAbsorbing(itemId);
+      // Only a book that ran out here moves playback on. Marking one finished
+      // by hand, or finishing it on another device, just lines the next one
+      // up - otherwise ticking off a few earlier books started each next one.
+      _addNextSeriesBookToAbsorbing(itemId,
+          autoPlay: !skipAutoAdvance && !fromRemote);
     }
 
     if (!skipAutoAdvance) {
@@ -692,7 +709,12 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         if (mode == 'manual') {
           _manualQueueAdvance(itemId);
         } else if (mode == 'auto_next') {
-          _autoAdvanceOffline(itemId);
+          // Online, _addNextSeriesBookToAbsorbing plays the real next book
+          // from the server's list. The offline path only knows downloads, so
+          // running it too raced ahead to whichever later book was downloaded.
+          if (isPodcast || isOffline || _api == null) {
+            _autoAdvanceOffline(itemId);
+          }
         } else if (mode == 'playlist') {
           _advanceInPlaylist(itemId);
         } else if (mode == 'collection') {
@@ -1001,7 +1023,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     }
   }
 
-  Future<void> _addNextSeriesBookToAbsorbing(String finishedBookId) async {
+  Future<void> _addNextSeriesBookToAbsorbing(String finishedBookId,
+      {bool autoPlay = true}) async {
     var finished = _itemDataWithSeries(finishedBookId);
     var (seriesId, currentSeq) =
         finished != null ? _StateMixin._extractSeries(finished) : (null, null);
@@ -1040,7 +1063,6 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
           if (book is! Map<String, dynamic>) continue;
           final id = book['id'] as String?;
           if (id == null || id == finishedBookId) continue;
-          if (_manualAbsorbRemoves.contains(id)) continue;
           if (_progressMap[id]?['isFinished'] == true) continue;
           final (sid, seq) = _StateMixin._extractSeries(book);
           if (sid != seriesId || seq == null || seq <= currentSeq) continue;
@@ -1053,7 +1075,6 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       for (final entry in _absorbingItemCache.entries) {
         final key = entry.key;
         if (key == finishedBookId || key.length > 36) continue;
-        if (_manualAbsorbRemoves.contains(key)) continue;
         if ((this as LibraryProvider).isItemFinishedByKey(key)) continue;
         final (sid, seq) = _StateMixin._extractSeries(entry.value);
         if (sid != seriesId || seq == null || seq <= currentSeq) continue;
@@ -1063,7 +1084,6 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       for (final dlInfo in DownloadService().downloadedItems) {
         final id = dlInfo.itemId;
         if (id == finishedBookId || id.length > 36) continue;
-        if (_manualAbsorbRemoves.contains(id)) continue;
         if (candidates.values.any((e) => e.key == id)) continue;
         if (_progressMap[id]?['isFinished'] == true) continue;
         final data = _itemDataWithSeries(id);
@@ -1080,6 +1100,9 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     }
 
     final nextSeq = candidates.keys.toList()..sort();
+    debugPrint('[Absorbing] Series $seriesId after seq $currentSeq: '
+        'candidates ${nextSeq.take(5).join(', ')}${nextSeq.length > 5 ? '...' : ''} '
+        '(server list=$usedServerList)');
     final next = candidates[nextSeq.first]!;
     final nextKey = next.key;
 
@@ -1091,11 +1114,12 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     }
     _absorbingItemCache[nextKey] = next.value;
     _manualAbsorbAdds.add(nextKey);
+    _manualAbsorbRemoves.remove(nextKey);
     _saveManualAbsorbing();
     notifyListeners();
     debugPrint('[Absorbing] Auto-added next series book: $nextKey (seq ${nextSeq.first})');
 
-    if (mode != 'auto_next') return;
+    if (mode != 'auto_next' || !autoPlay) return;
     if (AudioPlayerService.wasNoisyPause) return;
     if (AudioPlayerService().isPlaying) return;
     if (_api == null) return;
@@ -1103,6 +1127,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     final nextData = next.value;
     final media = nextData['media'] as Map<String, dynamic>? ?? {};
     final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
+    debugPrint('[Absorbing] Auto-playing next series book $nextKey after $finishedBookId');
     AudioPlayerService().playItem(
       api: _api!,
       itemId: nextKey,
@@ -1145,7 +1170,6 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         final id = dlInfo.itemId;
         if (id == finishedBookId) continue;
         if (id.length > 36) continue;
-        if (_manualAbsorbRemoves.contains(id)) continue;
         if (_progressMap[id]?['isFinished'] == true) continue;
 
         final data = _itemDataWithSeries(id);
@@ -1163,9 +1187,12 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       final next = candidates[nextSeq.first]!;
       final nextKey = next.key;
       final nextData = next.value;
+      debugPrint('[AutoAdvance] Offline: playing downloaded $nextKey (seq ${nextSeq.first}) '
+          'after $finishedBookId, candidates ${nextSeq.take(5).join(', ')}');
 
       _absorbingIdsAdd(nextKey, afterKey: finishedBookId);
       _absorbingItemCache[nextKey] = nextData;
+      _manualAbsorbRemoves.remove(nextKey);
       _saveManualAbsorbing();
       notifyListeners();
 
@@ -1215,7 +1242,54 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
           episodes[publishedAt] = entry;
         }
       }
-      if (finishedTimestamp == null || episodes.isEmpty) return;
+      // The queue only knows episodes that were put on it. Offline, the
+      // show's other downloads are just as playable, and each carries its
+      // own publish date, so they join the pick in date order too.
+      for (final info in dl.downloadedItems) {
+        if (!info.itemId.startsWith('$showId-')) continue;
+        final epId = info.itemId.substring(37);
+        if (epId != finishedEpId &&
+            (episodes.values.any((e) => e.key == info.itemId) ||
+                _progressMap[info.itemId]?['isFinished'] == true)) {
+          continue;
+        }
+        Map<String, dynamic>? session;
+        try {
+          session = jsonDecode(info.sessionData ?? '') as Map<String, dynamic>;
+        } catch (_) {
+          continue;
+        }
+        final item = session['libraryItem'] as Map<String, dynamic>? ?? {};
+        final media = item['media'] as Map<String, dynamic>? ?? {};
+        final own = (media['episodes'] as List<dynamic>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .firstWhere((e) => e['id'] == epId, orElse: () => const {});
+        final publishedAt = (own['publishedAt'] as num?)?.toInt();
+        if (publishedAt == null) continue;
+        if (epId == finishedEpId) {
+          finishedTimestamp ??= publishedAt;
+          continue;
+        }
+        final entity = <String, dynamic>{
+          'id': showId,
+          'libraryId': item['libraryId'] ?? info.libraryId,
+          'media': {
+            'metadata': media['metadata'] ??
+                {'title': info.title ?? '', 'authorName': info.author ?? ''},
+          },
+          'recentEpisode': {
+            ...own,
+            'duration': own['duration'] ?? session['duration'],
+          },
+          '_absorbingKey': info.itemId,
+        };
+        episodes[publishedAt] = MapEntry(info.itemId, entity);
+      }
+      if (finishedTimestamp == null || episodes.isEmpty) {
+        debugPrint('[AutoAdvance] offline podcast advance: nothing to play next '
+            '(finished date known=${finishedTimestamp != null}, candidates=${episodes.length})');
+        return;
+      }
 
       final sorted = episodes.keys.toList()..sort();
       final int? nextTimestamp;
@@ -1232,9 +1306,11 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       final ep = nextData['recentEpisode'] as Map<String, dynamic>;
       final nextEpId = ep['id'] as String;
 
+      _absorbingItemCache[nextKey] ??= nextData;
       _absorbingIdsAdd(nextKey, afterKey: finishedKey);
       _saveManualAbsorbing();
       notifyListeners();
+      debugPrint('[AutoAdvance] offline podcast advance -> $nextKey');
 
       final media = nextData['media'] as Map<String, dynamic>? ?? {};
       final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
@@ -1706,10 +1782,9 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
 
     final candidates = seriesQueueTail(
       current: current,
-      books: books.whereType<Map<String, dynamic>>().where((book) {
-        final id = book['id'] as String?;
-        return id != null && !_manualAbsorbRemoves.contains(id);
-      }),
+      books: books
+          .whereType<Map<String, dynamic>>()
+          .where((book) => book['id'] is String),
       currentKey: currentKey,
       currentSeriesId: seriesId,
       currentSequence: currentSequence,
@@ -2167,12 +2242,15 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     if (seriesId == null || currentSeq == null) return null;
 
     final candidates = <double, Map<String, dynamic>>{};
+    final skippedFinished = <double>[];
     void consider(String id, Map<String, dynamic> d) {
       if (id == currentBookId) return;
-      if (_manualAbsorbRemoves.contains(id)) return;
-      if (self.isItemFinishedByKey(id)) return;
       final (sid, seq) = _StateMixin._extractSeries(d);
       if (sid != seriesId || seq == null || seq <= currentSeq!) return;
+      if (self.isItemFinishedByKey(id)) {
+        skippedFinished.add(seq);
+        return;
+      }
       candidates[seq] = d;
     }
 
@@ -2212,10 +2290,14 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       }
     }
 
-    if (candidates.isEmpty) return null;
     final nextSeq = candidates.keys.toList()..sort();
-    final next = candidates[nextSeq.first]!;
-    return _entryTitle(next);
+    skippedFinished.sort();
+    debugPrint('[Queue] Up next in series after seq $currentSeq: '
+        '${nextSeq.isEmpty ? 'nothing' : 'seq ${nextSeq.first} "${_entryTitle(candidates[nextSeq.first]!)}"'} '
+        '(server list=$usedServerList, finished skipped: '
+        '${skippedFinished.isEmpty ? 'none' : skippedFinished.take(8).join(', ')})');
+    if (candidates.isEmpty) return null;
+    return _entryTitle(candidates[nextSeq.first]!);
   }
 
   Future<String?> _peekNextPodcastEpisode(String currentCompoundKey) async {

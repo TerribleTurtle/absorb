@@ -2,7 +2,10 @@ part of 'library_provider.dart';
 
 mixin _StateMixin on ChangeNotifier {
   AuthProvider? _auth;
-  ApiService? get _api => _auth?.apiService;
+  // Signed out, the library makes no server calls and shows what is on the
+  // phone, like offline.
+  ApiService? get _api => _signedOut ? null : _auth?.apiService;
+  bool get _signedOut => _auth?.isSignedOut ?? false;
 
   List<dynamic> _libraries = [];
   bool _librariesFromCache = false;
@@ -84,6 +87,7 @@ mixin _StateMixin on ChangeNotifier {
   bool _isReconnecting = false;
   Timer? _serverPingTimer;
   Timer? _healthCheckTimer;
+  Timer? _bookOrbitPollTimer;
   Timer? _localProbeTimer;
   int _localProbeFailures = 0;
   DateTime? _localLastReachableAt;
@@ -136,7 +140,7 @@ mixin _StateMixin on ChangeNotifier {
   bool get isLoadingCollections => _isLoadingCollections;
   List<String> get sectionOrder => _sectionOrder;
   Set<String> get hiddenSectionIds => _hiddenSectionIds;
-  bool get isOffline => _manualOffline || _networkOffline;
+  bool get isOffline => _manualOffline || _networkOffline || _signedOut;
   bool get isManualOffline => _manualOffline;
   bool get isReconnecting => _isReconnecting;
   Set<String> get manualAbsorbAdds => _manualAbsorbAdds;
@@ -398,6 +402,8 @@ mixin _StateMixin on ChangeNotifier {
     if (dl.localCoverPath != null) {
       return dl.localCoverPath;
     }
+    final kept = DownloadService().keptEbook(itemId);
+    if (kept?.localCoverPath != null) return kept!.localCoverPath;
 
     if (dl.status == DownloadStatus.none) {
       final match = DownloadService()

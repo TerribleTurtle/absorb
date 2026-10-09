@@ -27,6 +27,8 @@ import '../utils/absorbing_inclusion.dart';
 import '../l10n/app_localizations.dart';
 import '../main.dart' show rootNavigatorKey;
 import '../widgets/overlay_toast.dart';
+import '../services/ebook_cache.dart';
+import '../services/screen_wake.dart';
 
 part '_lp_state.dart';
 part '_lp_core.dart';
@@ -177,6 +179,10 @@ class LibraryProvider extends ChangeNotifier
         _stopServerPingTimer();
         _stopHealthCheckTimer();
         _isLoading = true;
+        // Signing back in after a lapsed session hands the still-playing
+        // book its new connection.
+        final freshApi = auth.apiService;
+        if (freshApi != null) AudioPlayerService().useApi(freshApi);
         notifyListeners();
       }
 
@@ -206,7 +212,13 @@ class LibraryProvider extends ChangeNotifier
         _buildProgressMap(auth);
 
         if (!auth.serverReachable) {
-          debugPrint('[Library] Server not reachable — going offline');
+          debugPrint(
+              '[Library] Server not reachable — going offline with ${_libraries.length} libraries '
+              '(fromCache=$_librariesFromCache selected=$_selectedLibraryId)');
+          unawaited(PlayerSettings.getPodcastTabEnabled().then((on) async {
+            final tabLib = await PlayerSettings.getPodcastTabLibraryId();
+            debugPrint('[Library] Offline start: podcast tab=$on library=$tabLib');
+          }));
           _networkOffline = true;
           _buildOfflineSections();
           _isLoading = false;
@@ -244,6 +256,7 @@ class LibraryProvider extends ChangeNotifier
             auth.setEreaderDevices(auth.filterDevicesForCurrentUser(devices));
           };
           socket.connect(auth.serverUrl!, auth.token!, customHeaders: auth.customHeaders);
+          _startBookOrbitPoll();
         }
         debugPrint('[Library] Calling loadLibraries()');
         await loadLibraries();
@@ -255,6 +268,40 @@ class LibraryProvider extends ChangeNotifier
         notifyListeners();
         _completeAccountLoad(accountLoadGeneration);
       });
+    } else if (auth.isSignedOut) {
+      // The session ended but the account stays: show what is on the phone
+      // until the user signs back in, which then loads like a fresh login.
+      final key = 'signed-out:${auth.username}@${auth.serverUrl}';
+      if (_lastAuthKey == key) return;
+      _lastAuthKey = key;
+      _lastUseLocalServer = null;
+      final generation = ++_accountLoadGeneration;
+      final completer = _accountReadyCompleter;
+      if (completer != null && !completer.isCompleted) completer.complete();
+      _accountReadyCompleter = null;
+      _connectivitySub?.cancel();
+      _connectivityDebounce?.cancel();
+      _stopServerPingTimer();
+      _stopHealthCheckTimer();
+      _stopBookOrbitPoll();
+      SocketService().disconnect();
+      _personalizedInFlight = null;
+      _networkOffline = false;
+      debugPrint('[Library] Signed out - showing what is on the phone');
+      () async {
+        await _loadManualAbsorbing();
+        await _loadRollingDownloadSeries();
+        await _loadSubscribedPodcasts();
+        await _loadYearHidden();
+        await _loadKnownEpisodeIds();
+        await _restoreCachedLibraries();
+        if (generation != _accountLoadGeneration) return;
+        _buildOfflineSections();
+        _isLoading = false;
+        notifyListeners();
+        refreshLocalProgress();
+      }();
+      notifyListeners();
     } else {
       _accountLoadGeneration++;
       final completer = _accountReadyCompleter;
@@ -310,6 +357,7 @@ class LibraryProvider extends ChangeNotifier
         _libraries = fetched;
         _librariesFromCache = false;
         await LibraryCache.save(fetched);
+        debugPrint('[Library] Saved ${fetched.length} libraries for offline starts');
         await _restoreSelectedLibrary();
 
         await _loadSectionPrefs();
@@ -341,9 +389,18 @@ class LibraryProvider extends ChangeNotifier
   }
 
   Future<void> _restoreCachedLibraries() async {
-    if (_libraries.isNotEmpty) return;
+    if (_libraries.isNotEmpty) {
+      debugPrint(
+          '[Library] Cached libraries not needed, already have ${_libraries.length}');
+      return;
+    }
     final cached = await LibraryCache.load();
-    if (cached.isEmpty) return;
+    if (cached.isEmpty) {
+      // Nothing saved while online, so offline there is one library at most
+      // and the switcher stays hidden (#313).
+      debugPrint('[Library] No saved libraries to restore for offline use');
+      return;
+    }
     // Widened copy: handing the cache's List<Map> to the List<dynamic> field
     // directly would tighten the runtime type and blow up firstWhere calls
     // whose orElse returns null.
@@ -363,10 +420,13 @@ class LibraryProvider extends ChangeNotifier
     final defaultId = _auth?.defaultLibraryId;
     if (savedId != null && _libraries.any((l) => l['id'] == savedId)) {
       _selectedLibraryId = savedId;
+      debugPrint('[Library] Selected library $savedId (last used)');
       return;
     }
     if (defaultId != null && _libraries.any((l) => l['id'] == defaultId)) {
       _selectedLibraryId = defaultId;
+      debugPrint(
+          '[Library] Selected library $defaultId (server default, last used was $savedId)');
       return;
     }
     final bookLibraries = _libraries
@@ -376,9 +436,14 @@ class LibraryProvider extends ChangeNotifier
     _selectedLibraryId = bookLibraries.isNotEmpty
         ? bookLibraries.first['id'] as String?
         : _libraries.first['id'] as String?;
+    debugPrint(
+        '[Library] Selected library $_selectedLibraryId (first book library, last used was $savedId)');
   }
 
   Future<void> selectLibrary(String libraryId) async {
+    debugPrint(
+        '[Library] selectLibrary $libraryId (podcast=${isPodcastLibraryId(libraryId)} '
+        'offline=$isOffline libraries=${_libraries.length})');
     // When Merge Libraries is on, the absorbing card stays visible across
     // libraries so the user can still control playback. Only stop on switch
     // when merge is off, otherwise the player would be unreachable from the

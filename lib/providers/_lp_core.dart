@@ -459,9 +459,23 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       }
       return (dl.itemId.length > 36) == isPodcast;
     }).toList();
+    final downloadedIds = downloads.map((d) => d.itemId).toSet();
+    final keptEbooks = isPodcast
+        ? const <DownloadInfo>[]
+        : DownloadService().keptEbooks.where((k) {
+            if (downloadedIds.contains(k.itemId)) return false;
+            final libraryId = k.libraryId;
+            if (libraryId != null &&
+                libraryId.isNotEmpty &&
+                _selectedLibraryId != null) {
+              return libraryId == _selectedLibraryId;
+            }
+            return true;
+          }).toList();
     debugPrint(
-        '[Library] Building offline sections: ${downloads.length}/${allDownloads.length} downloads (${isPodcast ? "podcast" : "book"})');
-    if (downloads.isEmpty) {
+        '[Library] Building offline sections: ${downloads.length}/${allDownloads.length} downloads (${isPodcast ? "podcast" : "book"}) '
+        '+${keptEbooks.length} kept ebooks library=$_selectedLibraryId of ${_libraries.length}');
+    if (downloads.isEmpty && keptEbooks.isEmpty) {
       _personalizedSections = [];
       _errorMessage = null;
       _isLoading = false;
@@ -475,6 +489,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       double duration = 0;
       List<dynamic> chapters = [];
       String? episodeTitle;
+      Map<String, dynamic>? ebookFile;
       if (dl.sessionData != null) {
         try {
           final session = jsonDecode(dl.sessionData!) as Map<String, dynamic>;
@@ -482,6 +497,8 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           chapters = session['chapters'] as List<dynamic>? ?? [];
           episodeTitle = session['episodeTitle'] as String? ??
               session['displayTitle'] as String?;
+          ebookFile = resolveEbookFile(
+              session['libraryItem'] as Map<String, dynamic>?);
         } catch (_) {}
       }
 
@@ -518,6 +535,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
             },
             'duration': duration,
             'chapters': chapters,
+            if (ebookFile != null) 'ebookFile': ebookFile,
           },
         };
       }
@@ -530,11 +548,29 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       final isFinished =
           _progressMap[dl.itemId]?['isFinished'] == true || progress >= 0.999;
 
-      if (progress > 0 && !isFinished) {
-        continueEntities.add(entity);
-      } else {
-        downloadedEntities.add(entity);
-      }
+      if (progress > 0 && !isFinished) continueEntities.add(entity);
+      downloadedEntities.add(entity);
+    }
+    for (final kept in keptEbooks) {
+      Map<String, dynamic>? item;
+      try {
+        item = (jsonDecode(kept.sessionData ?? '{}')
+            as Map<String, dynamic>)['libraryItem'] as Map<String, dynamic>?;
+      } catch (_) {}
+      final ebookFile = resolveEbookFile(item);
+      downloadedEntities.add({
+        'id': kept.itemId,
+        if (kept.libraryId != null) 'libraryId': kept.libraryId,
+        'media': {
+          'metadata': {
+            'title': kept.title ?? 'Unknown Title',
+            'authorName': kept.author ?? '',
+          },
+          'duration': 0,
+          'chapters': const <dynamic>[],
+          if (ebookFile != null) 'ebookFile': ebookFile,
+        },
+      });
     }
 
     _personalizedSections = [
@@ -585,6 +621,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       double duration = 0;
       List<dynamic> chapters = [];
       String? episodeTitle;
+      Map<String, dynamic>? ebookFile;
       if (dl.sessionData != null) {
         try {
           final session = jsonDecode(dl.sessionData!) as Map<String, dynamic>;
@@ -592,6 +629,8 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           chapters = session['chapters'] as List<dynamic>? ?? [];
           episodeTitle = session['episodeTitle'] as String? ??
               session['displayTitle'] as String?;
+          ebookFile = resolveEbookFile(
+              session['libraryItem'] as Map<String, dynamic>?);
         } catch (_) {}
       }
 
@@ -627,6 +666,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
             },
             'duration': duration,
             'chapters': chapters,
+            if (ebookFile != null) 'ebookFile': ebookFile,
           },
         });
       }
@@ -1208,6 +1248,16 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
   static const _localProbeFailuresToFlip = 2;
   static const _localProbePiggybackWindow = Duration(seconds: 25);
 
+  // Away from home the local server never answers, and a ping every 30s all
+  // day on mobile data (or with no signal at all) is pure waste. After two
+  // minutes of misses the checks spread out to at most every 5 minutes. A
+  // network change starts the fast checks again, so joining home WiFi still
+  // switches over straight away.
+  int _remoteProbeMisses = 0;
+  DateTime? _nextRemoteProbeAt;
+  static const _remoteProbeFastMisses = 4;
+  static const _remoteProbeMaxGap = Duration(minutes: 5);
+
   void _startLocalProbeTimer() {
     final auth = _auth;
     if (auth == null) return;
@@ -1221,6 +1271,8 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       _stopLocalProbeTimer();
       return;
     }
+    _remoteProbeMisses = 0;
+    _nextRemoteProbeAt = null;
     if (_localProbeTimer != null) return;
     _localProbeFailures = 0;
     _localProbeTimer = Timer.periodic(_localProbeInterval, (_) => _probeLocalServer());
@@ -1258,6 +1310,12 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
         DateTime.now().difference(last) < _localProbePiggybackWindow) {
       return;
     }
+    final nextRemote = _nextRemoteProbeAt;
+    if (!auth.useLocalServer &&
+        nextRemote != null &&
+        DateTime.now().isBefore(nextRemote)) {
+      return;
+    }
 
     final probe = await ApiService.pingServerDetailed(
       auth.localServerUrl,
@@ -1287,8 +1345,20 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       await auth.checkLocalServer();
       _localLastReachableAt = DateTime.now();
       _localProbeFailures = 0;
+      _remoteProbeMisses = 0;
+      _nextRemoteProbeAt = null;
     } else {
-      debugPrint('[Library] Local probe miss while on remote (${probe.detail})');
+      _remoteProbeMisses++;
+      if (_remoteProbeMisses > _remoteProbeFastMisses) {
+        final steps = _remoteProbeMisses - _remoteProbeFastMisses;
+        final gap = _localProbeInterval * (1 << steps.clamp(0, 4));
+        final wait = gap < _remoteProbeMaxGap ? gap : _remoteProbeMaxGap;
+        _nextRemoteProbeAt = DateTime.now().add(wait);
+        debugPrint(
+            '[Library] Local probe miss while on remote (${probe.detail}), next in ${wait.inSeconds}s');
+      } else {
+        debugPrint('[Library] Local probe miss while on remote (${probe.detail})');
+      }
     }
   }
 
@@ -1326,6 +1396,43 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
     _healthCheckTimer = null;
   }
 
+  /// BookOrbit pushes no progress events, so while the app is open the book
+  /// sitting paused in the player is checked against the server instead, and
+  /// a newer position from another device goes through the same handler the
+  /// Audiobookshelf socket feeds.
+  void _startBookOrbitPoll() {
+    _bookOrbitPollTimer?.cancel();
+    _bookOrbitPollTimer = null;
+    if (_auth?.isBookOrbit != true) return;
+    if (_isBackgrounded || _readerQuiet || PlayerSettings.einkMode) return;
+    _bookOrbitPollTimer = Timer.periodic(
+        const Duration(seconds: 30), (_) => _pollPausedBookProgress());
+  }
+
+  void _stopBookOrbitPoll() {
+    _bookOrbitPollTimer?.cancel();
+    _bookOrbitPollTimer = null;
+  }
+
+  Future<void> _pollPausedBookProgress() async {
+    final api = _api;
+    if (api == null || !api.isBookOrbit || isOffline) return;
+    final player = AudioPlayerService();
+    final itemId = player.currentItemId;
+    if (!player.hasBook || player.isPlaying || itemId == null) return;
+    if (player.currentEpisodeId != null) return;
+    try {
+      final mp = await api.getItemProgress(itemId);
+      if (mp == null || player.isPlaying || player.currentItemId != itemId) return;
+      final serverUpd = (mp['lastUpdate'] as num?)?.toInt() ?? 0;
+      if (serverUpd <= await ProgressSyncService().getSavedTimestamp(itemId)) return;
+      debugPrint('[Sync] BookOrbit has a newer position for the paused book');
+      _onRemoteProgressUpdated(mp);
+    } catch (e) {
+      debugPrint('[Sync] BookOrbit progress poll failed: $e');
+    }
+  }
+
   // ── Battery-saving lifecycle ──
 
   void onAppBackgrounded() {
@@ -1333,6 +1440,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
     _backgroundedAt = DateTime.now();
     _stopServerPingTimer();
     _stopHealthCheckTimer();
+    _stopBookOrbitPoll();
     if (!AudioPlayerService().isPlaying) {
       _stopLocalProbeTimer();
     }
@@ -1364,11 +1472,13 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
   void setReaderQuiet(bool quiet) {
     if (_readerQuiet == quiet) return;
     _readerQuiet = quiet;
+    PlayerScreenWake.covered.value = quiet;
     if (quiet) {
       _readerQuietAt = DateTime.now();
       debugPrint('[Library] Reader open - quieting live work');
       _stopServerPingTimer();
       _stopHealthCheckTimer();
+      _stopBookOrbitPoll();
       if (!AudioPlayerService().isPlaying) _stopLocalProbeTimer();
       _softDisconnectSocket();
       return;
@@ -1390,6 +1500,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       debugPrint('[Library] E-ink mode on - quieting live work');
       _stopServerPingTimer();
       _stopHealthCheckTimer();
+      _stopBookOrbitPoll();
       if (!AudioPlayerService().isPlaying) _stopLocalProbeTimer();
       _softDisconnectSocket();
       return;
@@ -1403,7 +1514,9 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
   /// and awake. [quietSince] is when live work stopped, so a long gap can
   /// replay what the socket would have delivered.
   void _resumeLiveWork({DateTime? quietSince}) {
+    if (_auth?.isBookOrbit == true) unawaited(_api?.ensureMediaReady());
     _softReconnectSocket();
+    _startBookOrbitPoll();
     if (_networkOffline && _deviceHasConnectivity && !_manualOffline) {
       _startServerPingTimer();
     } else if (!_networkOffline && !_manualOffline) {
@@ -1420,6 +1533,10 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           : DateTime.now().difference(quietSince);
       if (away != null && away > const Duration(seconds: 30)) {
         _catchUpAfterBackground();
+        if (_auth?.isBookOrbit == true) {
+          unawaited(_pollPausedBookProgress());
+          unawaited(_catchUpRemoteProgress());
+        }
       }
     }
   }
@@ -2033,6 +2150,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
 
   Future<Map<String, dynamic>?> createPlaylist(String name) async {
     if (_api == null || _selectedLibraryId == null) return null;
+    if (_api!.isBookOrbit) return createCollection(name);
     final result = await _api!.createPlaylist(_selectedLibraryId!, name);
     if (result != null) {
       _playlists = [..._playlists, result];
@@ -2047,6 +2165,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
     String? episodeId,
   }) async {
     if (_api == null) return false;
+    if (_api!.isBookOrbit) return addToCollection(playlistId, libraryItemId);
     final updated = await _api!.addItemToPlaylist(
       playlistId, libraryItemId, episodeId: episodeId,
     );
@@ -2063,6 +2182,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
     String? episodeId,
   }) async {
     if (_api == null) return false;
+    if (_api!.isBookOrbit) return removeFromCollection(playlistId, libraryItemId);
     final updated = await _api!.removeItemFromPlaylist(
       playlistId, libraryItemId, episodeId: episodeId,
     );
@@ -2094,6 +2214,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
 
   Future<bool> deletePlaylist(String playlistId) async {
     if (_api == null) return false;
+    if (_api!.isBookOrbit) return await deleteCollection(playlistId) == 200;
     final ok = await _api!.deletePlaylist(playlistId);
     if (ok) {
       _playlists = _playlists.where((p) => (p as Map)['id'] != playlistId).toList();
@@ -2165,6 +2286,13 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       return true;
     }
     return false;
+  }
+
+  Future<bool> setCollectionPublic(String collectionId, bool isPublic) async {
+    if (_api == null) return false;
+    final ok = await _api!.setCollectionPublic(collectionId, isPublic);
+    if (ok) await _doLoadCollections();
+    return ok;
   }
 
   Future<bool> reorderCollectionBooks(
