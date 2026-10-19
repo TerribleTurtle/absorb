@@ -2878,6 +2878,8 @@ class AudioPlayerService extends ChangeNotifier {
       if (_player == null) return;
     }
     _lastSeekTargetSec = absoluteSeconds;
+    // Paused seeks don't tick positionStream; update now so a stream retry doesn't jump back.
+    _lastKnownPositionSec = absoluteSeconds;
     _lastSeekAt = DateTime.now();
 
     // A seek already interrupts audio, so if a fresh session is waiting this
@@ -6444,14 +6446,14 @@ class AudioPlayerService extends ChangeNotifier {
 
         // Save locally every 5 seconds (always works, even offline)
         if (sec % 5 == 0 && sec != _lastSyncSecond && _currentItemId != null) {
-          _lastSyncSecond = sec;
-          _saveProgressLocal(absolutePos);
           // Seeks emit position events while paused too (auto-rewind on
           // resume, scrubbing), and such a tick must not accrue or sync -
           // the clocks are stale from the pause, so it would credit the
           // paused span as listening. The pause handler already banked the
           // playing tail.
           if (_player?.playing != true) return;
+          _lastSyncSecond = sec;
+          _saveProgressLocal(absolutePos);
           // Bank listening to durable storage every tick, decoupled from the
           // server push below, so an abrupt kill loses at most one tick.
           await _accrueListening(absolutePos);
@@ -7135,6 +7137,7 @@ class AudioPlayerService extends ChangeNotifier {
       );
     }
     if (ok) {
+      if (streamKey != null) unawaited(_progressSync.clearPendingSync(streamKey));
       _logEvent(PlaybackEventType.syncServer, detail: '+${elapsed}s');
     }
     if (!ok && !_syncRecoveryInProgress) {
@@ -7696,7 +7699,7 @@ class AudioPlayerService extends ChangeNotifier {
       // Timestamp gate, like the sync path: our own pre-rewind position still
       // sits on the server after a resume, so position alone would call every
       // auto-rewind "server ahead".
-      final ahead = serverTs > localTs && serverPos > localPos + 5.0;
+      final ahead = serverTs > localTs && (serverPos - localPos).abs() > 5.0;
       debugPrint(
         '[Player] Resume server-check (pre-start): server=${serverPos}s(ts=$serverTs) vs local=${localPos}s(ts=$localTs) -> ${ahead ? "SEEKING" : "keep local"}',
       );
