@@ -117,8 +117,9 @@ class AppShell extends StatefulWidget {
     // first. Otherwise switching to the Library tab leaves the player
     // covering the filtered library underneath. Caller (e.g. the book
     // detail sheet) has already popped its own modal route at this point.
-    if (inst._expandedIsOpen && inst.mounted) {
-      Navigator.of(inst.context, rootNavigator: true).maybePop();
+    if (inst.mounted) {
+      final nav = Navigator.of(inst.context, rootNavigator: true);
+      if (nav.canPop()) nav.popUntil((r) => r.isFirst);
     }
     inst._navigateTo(1);
     // The retry budget has to survive the fade transition (~200ms by
