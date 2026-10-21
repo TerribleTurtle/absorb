@@ -19,6 +19,8 @@ class SocketService {
   String? _token;
   String? _serverUrl;
   DateTime? _connectedAt;
+  bool _refreshingAuth = false;
+  Future<String?> Function()? tokenRefresher;
 
   bool get isConnected => _socket?.connected ?? false;
   bool get hasSocket => _socket != null;
@@ -338,9 +340,27 @@ class SocketService {
   /// Update the stored token (e.g. after a JWT refresh) and re-auth if connected.
   void updateToken(String newToken) {
     _token = newToken;
+    if (_refreshingAuth) return;
     if (_socket?.connected == true) {
       debugPrint('[Socket] Re-authenticating with refreshed token');
       _socket!.emit('auth', _token);
+    }
+  }
+
+  Future<void> _authenticateSocket(io.Socket socket) async {
+    _connectedAt = DateTime.now();
+    if (tokenRefresher != null) {
+      _refreshingAuth = true;
+      try {
+        final fresh = await tokenRefresher!();
+        if (identical(_socket, socket) && fresh != null) _token = fresh;
+      } finally {
+        _refreshingAuth = false;
+      }
+    }
+    if (identical(_socket, socket) && _token != null) {
+      debugPrint('[Socket] Connected, sending auth');
+      socket.emit('auth', _token);
     }
   }
 
@@ -365,13 +385,10 @@ class SocketService {
 
     try {
       _socket = _createSocket(serverUrl);
+      final s = _socket!;
 
       // onConnect fires on initial connect AND every reconnect
-      _socket!.onConnect((_) {
-        _connectedAt = DateTime.now();
-        debugPrint('[Socket] Connected, sending auth');
-        _socket!.emit('auth', _token);
-      });
+      s.onConnect((_) => _authenticateSocket(s));
 
       _socket!.on('init', (_) {
         debugPrint('[Socket] Authenticated - user is online');
@@ -583,12 +600,9 @@ class SocketService {
 
     try {
       _socket = _createSocket(url);
+      final s = _socket!;
 
-      _socket!.onConnect((_) {
-        _connectedAt = DateTime.now();
-        debugPrint('[Socket] Connected, sending auth');
-        _socket!.emit('auth', _token);
-      });
+      s.onConnect((_) => _authenticateSocket(s));
 
       _socket!.on('init', (_) {
         debugPrint('[Socket] Authenticated - user is online');

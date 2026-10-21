@@ -891,6 +891,8 @@ class ApiService {
     }
   }
 
+  Future<void> ensureFreshAccessToken() => _ensureFreshAccessToken();
+
   /// Make an authenticated GET request, retrying once on 401 with a refreshed token.
   ///
   /// [sendRefreshTokenHeader] adds `x-refresh-token` from whatever the current
