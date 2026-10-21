@@ -465,7 +465,7 @@ class _AbsorbingScreenState extends State<AbsorbingScreen> {
     // absorbing list. Online we keep Absorbing focused on started/queued items;
     // offline the user has no other way to reach unstarted downloads, so we
     // merge them in. Started ones already appear via the absorbingBookIds path.
-    if (lib.isOffline) {
+    if (lib.isOffline && !lib.isPodcastLibrary) {
       final seenKeys = items.map(_absorbingKey).toSet();
       for (final section in lib.personalizedSections) {
         if ((section['id'] as String?) != 'downloaded-books') continue;
@@ -843,7 +843,7 @@ class _AbsorbingScreenState extends State<AbsorbingScreen> {
               child: showBlockingLoader
                   ? Center(child: CircularProgressIndicator(strokeWidth: 2, color: cs.onSurface.withValues(alpha: 0.24)))
                   : books.isEmpty
-                      ? _emptyState(cs, tt, effectiveOffline, l)
+                      ? _emptyState(cs, tt, effectiveOffline && lib.personalizedSections.isEmpty, l)
                       : books.length == 1
                           ? LayoutBuilder(
                               builder: (context, constraints) {

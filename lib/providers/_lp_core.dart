@@ -485,6 +485,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
 
     final continueEntities = <Map<String, dynamic>>[];
     final downloadedEntities = <Map<String, dynamic>>[];
+    final showEpisodes = <String, List<Map<String, dynamic>>>{};
     for (final dl in downloads) {
       double duration = 0;
       List<dynamic> chapters = [];
@@ -505,26 +506,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       final isCompound = dl.itemId.length > 36;
       late final Map<String, dynamic> entity;
       if (isCompound) {
-        final showId = dl.itemId.substring(0, 36);
-        final episodeId = dl.itemId.substring(37);
-        entity = {
-          'id': showId,
-          '_absorbingKey': dl.itemId,
-          'recentEpisode': {
-            'id': episodeId,
-            'title': episodeTitle ?? dl.title ?? 'Episode',
-            'duration': duration,
-            'chapters': chapters,
-          },
-          'media': {
-            'metadata': {
-              'title': dl.title ?? 'Unknown Title',
-              'authorName': dl.author ?? '',
-            },
-            'duration': duration,
-            'chapters': chapters,
-          },
-        };
+        entity = _offlinePodcastEntity(dl, showEpisodes, episodeTitle);
       } else {
         entity = {
           'id': dl.itemId,
@@ -591,6 +573,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
     ];
     _errorMessage = null;
     _isLoading = false;
+    unawaited((this as _AbsorbingMixin)._updateAbsorbingCache());
   }
 
   void _onDownloadsChanged() {
@@ -649,7 +632,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           },
           'media': {
             'metadata': {
-              'title': dl.title ?? 'Unknown Title',
+              'title': dl.author ?? dl.title ?? 'Unknown Title',
               'authorName': dl.author ?? '',
             },
             'duration': duration,
@@ -678,6 +661,55 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       'type': isPodcast ? 'podcast' : 'book',
       'entities': entities,
     });
+  }
+
+  List<Map<String, dynamic>> offlinePodcastEntities(
+      {Iterable<DownloadInfo>? items, String? libraryId}) {
+    final id = libraryId ?? _selectedLibraryId ?? '';
+    final list = items ?? DownloadService().downloadedItems.where((dl) =>
+        dl.itemId.length > 36 && (id.isEmpty || (dl.libraryId?.isEmpty ?? true) || dl.libraryId == id));
+    final showEpisodes = <String, List<Map<String, dynamic>>>{};
+    return [for (final dl in list) if (dl.itemId.length > 36) _offlinePodcastEntity(dl, showEpisodes)];
+  }
+
+  Map<String, dynamic> _offlinePodcastEntity(DownloadInfo dl,
+      Map<String, List<Map<String, dynamic>>> showEpisodes, [String? epTitle]) {
+    Map<String, dynamic>? session;
+    if (dl.sessionData != null) {
+      try {
+        session = jsonDecode(dl.sessionData!) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    final duration = (session?['duration'] as num?)?.toDouble() ?? 0;
+    final chapters = session?['chapters'] as List<dynamic>? ?? [];
+    final episodeTitle = epTitle ?? (session?['episodeTitle'] ?? session?['displayTitle']) as String?;
+    final itemMedia = (session?['libraryItem'] as Map<String, dynamic>?)?['media'] as Map<String, dynamic>?;
+    final showId = dl.itemId.substring(0, 36);
+    final episodeId = dl.itemId.substring(37);
+    final own = (itemMedia?['episodes'] as List<dynamic>?)
+        ?.whereType<Map<String, dynamic>>()
+        .where((e) => e['id'] == episodeId)
+        .firstOrNull;
+    final ep = <String, dynamic>{
+      ...?own,
+      'id': episodeId,
+      'title': episodeTitle ?? own?['title'] ?? dl.title ?? 'Episode',
+      'duration': duration > 0 ? duration : (own?['duration'] ?? 0),
+      'chapters': chapters,
+    };
+    return {
+      'id': showId,
+      if (dl.libraryId != null) 'libraryId': dl.libraryId,
+      '_absorbingKey': dl.itemId,
+      'recentEpisode': ep,
+      'media': {
+        'metadata': itemMedia?['metadata'] as Map<String, dynamic>? ??
+            {'title': dl.author ?? dl.title ?? 'Unknown Title', 'authorName': dl.author ?? ''},
+        'duration': duration,
+        'chapters': chapters,
+        'episodes': showEpisodes.putIfAbsent(showId, () => [])..add(ep),
+      },
+    };
   }
 
   // ── Progress ──

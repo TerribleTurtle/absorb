@@ -1255,7 +1255,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         if (ep == null) continue;
         final epId = ep['id'] as String?;
         if (epId == null) continue;
-        final publishedAt = (ep['publishedAt'] as num?)?.toInt() ?? 0;
+        final publishedAt = (ep['publishedAt'] as num?)?.toInt();
+        if (publishedAt == null) continue;
 
         if (epId == finishedEpId) {
           finishedTimestamp = publishedAt;
@@ -1984,9 +1985,14 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
   // ── Public fetch helpers for sheets ─────────────────────────────────
 
   Future<Map<String, dynamic>?> fetchLibraryItem(String itemId) async {
-    if (_api == null) return null;
     final id = itemId.length > 36 ? itemId.substring(0, 36) : itemId;
-    return _api!.getLibraryItem(id);
+    if (_api != null && !(this as LibraryProvider).isOffline) {
+      final item = await _api!.getLibraryItem(id);
+      if (item != null) return item;
+    }
+    return offlinePodcastEntities(
+      items: DownloadService().downloadedItems.where((dl) => dl.itemId.startsWith('$id-')),
+    ).firstOrNull;
   }
 
   Future<List<Map<String, dynamic>>> fetchBooksBySeries(
@@ -2359,8 +2365,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         as List<dynamic>?;
     if (cachedEps != null && cachedEps.isNotEmpty) {
       eps = cachedEps;
-    } else if (_api != null) {
-      final fullItem = await _api!.getLibraryItem(showId);
+    } else {
+      final fullItem = await fetchLibraryItem(showId);
       final media = fullItem?['media'] as Map<String, dynamic>? ?? const {};
       eps = media['episodes'] as List<dynamic>? ?? const [];
     }

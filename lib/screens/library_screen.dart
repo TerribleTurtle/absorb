@@ -1411,7 +1411,15 @@ class LibraryScreenState extends State<LibraryScreen>
     }).toList();
 
     final items = <Map<String, dynamic>>[];
-    for (final dl in downloads) {
+    if (isPodcast) {
+      final shows = <String, Map<String, dynamic>>{};
+      for (final e in lib.offlinePodcastEntities(items: downloads)) {
+        final id = e['id'] as String;
+        shows[id] ??= {'id': id, 'mediaType': 'podcast', 'media': e['media']};
+      }
+      items.addAll(shows.values);
+    } else
+      for (final dl in downloads) {
       double duration = 0;
       List<dynamic> chapters = [];
       if (dl.sessionData != null) {
@@ -2913,7 +2921,7 @@ class LibraryScreenState extends State<LibraryScreen>
                           : _podcastView == 1
                           ? PodcastEpisodeFeed(
                               key: ValueKey(
-                                'epfeed-${libWatch.selectedLibraryId}',
+                                'epfeed-${libWatch.selectedLibraryId}-${libWatch.isOffline}',
                               ),
                               libraryId: libWatch.selectedLibraryId ?? '',
                               headerSliver: _buildHeaderSliver(
