@@ -535,6 +535,24 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
           : null,
       episodeDuration: startingEpisode && duration > 0 ? duration : null,
     );
+    if (key.length <= 36) {
+      var data = _itemDataWithSeries(key);
+      if (data == null && _api != null && !isOffline) {
+        data = await _api!.getLibraryItem(key);
+      }
+      final (sid, _) =
+          data != null ? _StateMixin._extractSeries(data) : (null, null);
+      if (sid != null) {
+        for (final otherId in _absorbingBookIds) {
+          if (otherId == key || otherId.length > 36) continue;
+          final other = _itemDataWithSeries(otherId);
+          if (other != null && _StateMixin._extractSeries(other).$1 == sid) {
+            await PlayerSettings.noteBookSeries(otherId, sid);
+          }
+        }
+        await PlayerSettings.noteBookSeries(key, sid);
+      }
+    }
     if (!wasFinished) return;
 
     try {
@@ -1125,6 +1143,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     final nextKey = next.key;
 
     final mode = await PlayerSettings.getBookQueueMode();
+    await PlayerSettings.noteBookSeries(finishedBookId, seriesId);
+    await PlayerSettings.noteBookSeries(nextKey, seriesId);
     if (mode == 'auto_next') {
       _absorbingIdsAdd(nextKey, afterKey: finishedBookId);
     } else {
@@ -1163,7 +1183,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
   }
 
   void _autoAdvanceOfflineBook(String finishedBookId) {
-    PlayerSettings.getBookQueueMode().then((mode) {
+    PlayerSettings.getBookQueueMode().then((mode) async {
       // Alpha: bail-reason logs for GH #186 (book restart). Each silent return
       // here was a suspect in the advance-didn't-fire hypothesis.
       if (mode != 'auto_next') {
@@ -1212,6 +1232,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       debugPrint('[AutoAdvance] Offline: playing downloaded $nextKey (seq ${nextSeq.first}) '
           'after $finishedBookId, candidates ${nextSeq.take(5).join(', ')}');
 
+      await PlayerSettings.noteBookSeries(finishedBookId, seriesId);
+      await PlayerSettings.noteBookSeries(nextKey, seriesId);
       _absorbingIdsAdd(nextKey, afterKey: finishedBookId);
       _absorbingItemCache[nextKey] = nextData;
       _manualAbsorbRemoves.remove(nextKey);
