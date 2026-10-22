@@ -485,6 +485,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
 
     final continueEntities = <Map<String, dynamic>>[];
     final downloadedEntities = <Map<String, dynamic>>[];
+    final showEpisodes = <String, List<Map<String, dynamic>>>{};
     for (final dl in downloads) {
       double duration = 0;
       List<dynamic> chapters = [];
@@ -505,26 +506,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       final isCompound = dl.itemId.length > 36;
       late final Map<String, dynamic> entity;
       if (isCompound) {
-        final showId = dl.itemId.substring(0, 36);
-        final episodeId = dl.itemId.substring(37);
-        entity = {
-          'id': showId,
-          '_absorbingKey': dl.itemId,
-          'recentEpisode': {
-            'id': episodeId,
-            'title': episodeTitle ?? dl.title ?? 'Episode',
-            'duration': duration,
-            'chapters': chapters,
-          },
-          'media': {
-            'metadata': {
-              'title': dl.title ?? 'Unknown Title',
-              'authorName': dl.author ?? '',
-            },
-            'duration': duration,
-            'chapters': chapters,
-          },
-        };
+        entity = _offlinePodcastEntity(dl, showEpisodes, episodeTitle);
       } else {
         entity = {
           'id': dl.itemId,
@@ -591,6 +573,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
     ];
     _errorMessage = null;
     _isLoading = false;
+    unawaited((this as _AbsorbingMixin)._updateAbsorbingCache());
   }
 
   void _onDownloadsChanged() {
@@ -649,7 +632,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           },
           'media': {
             'metadata': {
-              'title': dl.title ?? 'Unknown Title',
+              'title': dl.author ?? dl.title ?? 'Unknown Title',
               'authorName': dl.author ?? '',
             },
             'duration': duration,
@@ -678,6 +661,55 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
       'type': isPodcast ? 'podcast' : 'book',
       'entities': entities,
     });
+  }
+
+  List<Map<String, dynamic>> offlinePodcastEntities(
+      {Iterable<DownloadInfo>? items, String? libraryId}) {
+    final id = libraryId ?? _selectedLibraryId ?? '';
+    final list = items ?? DownloadService().downloadedItems.where((dl) =>
+        dl.itemId.length > 36 && (id.isEmpty || (dl.libraryId?.isEmpty ?? true) || dl.libraryId == id));
+    final showEpisodes = <String, List<Map<String, dynamic>>>{};
+    return [for (final dl in list) if (dl.itemId.length > 36) _offlinePodcastEntity(dl, showEpisodes)];
+  }
+
+  Map<String, dynamic> _offlinePodcastEntity(DownloadInfo dl,
+      Map<String, List<Map<String, dynamic>>> showEpisodes, [String? epTitle]) {
+    Map<String, dynamic>? session;
+    if (dl.sessionData != null) {
+      try {
+        session = jsonDecode(dl.sessionData!) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    final duration = (session?['duration'] as num?)?.toDouble() ?? 0;
+    final chapters = session?['chapters'] as List<dynamic>? ?? [];
+    final episodeTitle = epTitle ?? (session?['episodeTitle'] ?? session?['displayTitle']) as String?;
+    final itemMedia = (session?['libraryItem'] as Map<String, dynamic>?)?['media'] as Map<String, dynamic>?;
+    final showId = dl.itemId.substring(0, 36);
+    final episodeId = dl.itemId.substring(37);
+    final own = (itemMedia?['episodes'] as List<dynamic>?)
+        ?.whereType<Map<String, dynamic>>()
+        .where((e) => e['id'] == episodeId)
+        .firstOrNull;
+    final ep = <String, dynamic>{
+      ...?own,
+      'id': episodeId,
+      'title': episodeTitle ?? own?['title'] ?? dl.title ?? 'Episode',
+      'duration': duration > 0 ? duration : (own?['duration'] ?? 0),
+      'chapters': chapters,
+    };
+    return {
+      'id': showId,
+      if (dl.libraryId != null) 'libraryId': dl.libraryId,
+      '_absorbingKey': dl.itemId,
+      'recentEpisode': ep,
+      'media': {
+        'metadata': itemMedia?['metadata'] as Map<String, dynamic>? ??
+            {'title': dl.author ?? dl.title ?? 'Unknown Title', 'authorName': dl.author ?? ''},
+        'duration': duration,
+        'chapters': chapters,
+        'episodes': showEpisodes.putIfAbsent(showId, () => [])..add(ep),
+      },
+    };
   }
 
   // ── Progress ──
@@ -911,6 +943,12 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           final progress = (currentTime / duration).clamp(0.0, 1.0);
           if (progress >= 0.99 && !serverFinished) continue;
           if (serverFinished) continue;
+          final localTs = (data['timestamp'] as num?)?.toInt() ?? 0;
+          final serverUpd = (_progressMap[itemId]?['lastUpdate'] as num?)?.toInt() ?? 0;
+          if (serverUpd > localTs) {
+            _localProgressOverrides.remove(itemId);
+            continue;
+          }
           _localProgressOverrides[itemId] = progress;
           if (currentTime > 0) _resetItems.remove(itemId);
         }
@@ -969,6 +1007,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           if (itemId != null) {
             final key = episodeId != null ? '$itemId-$episodeId' : itemId;
             _progressMap[key] = mp;
+            unawaited(_storeNewerServerPosition(key, mp));
           }
         }
       }
@@ -1031,6 +1070,11 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
               };
             }
           }
+          final prevProgressMap = _progressMap;
+          final player = AudioPlayerService();
+          final playingKey = player.currentEpisodeId != null
+              ? '${player.currentItemId}-${player.currentEpisodeId}'
+              : player.currentItemId;
           _progressMap = {};
           for (final mp in progressList) {
             final itemId = mp['libraryItemId'] as String?;
@@ -1038,6 +1082,18 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
             if (itemId != null) {
               final key = episodeId != null ? '$itemId-$episodeId' : itemId;
               _progressMap[key] = mp;
+              if (!(key == playingKey && player.isPlaying)) {
+                unawaited(_storeNewerServerPosition(key, mp));
+              }
+            }
+          }
+          if (playingKey != null && player.hasBook && !player.isPlaying) {
+            final mp = _progressMap[playingKey];
+            final prevUpd = ((prevProgressMap[playingKey]?['lastUpdate']) as num?)?.toInt() ?? 0;
+            if (mp != null && mp['isFinished'] != true &&
+                ((mp['lastUpdate'] as num?)?.toInt() ?? 0) > prevUpd) {
+              _progressMap[playingKey] = prevProgressMap[playingKey] ?? const {};
+              _onRemoteProgressUpdated(mp);
             }
           }
           for (final entry in localFinished.entries) {
@@ -1088,6 +1144,9 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           _localProgressOverrides.removeWhere((key, localProgress) {
             if (pendingSyncs.contains(key)) return false;
             if (_locallyFinishedItems.contains(key)) return false;
+            final prevUpd = ((prevProgressMap[key]?['lastUpdate']) as num?)?.toInt() ?? 0;
+            final serverUpd = ((_progressMap[key]?['lastUpdate']) as num?)?.toInt() ?? 0;
+            if (serverUpd > prevUpd) return true;
             // Keep the override if local progress is ahead of server
             final serverProgress = ((_progressMap[key]?['progress'] as num?)?.toDouble()) ?? 0;
             if (localProgress > serverProgress + 0.001) return false;

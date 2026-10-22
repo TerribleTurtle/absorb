@@ -1399,11 +1399,61 @@ class PlayerSettings {
 
   // ── Per-book speed persistence ──
 
-  static Future<double?> getBookSpeed(String itemId) =>
-      ScopedPrefs.getDouble('bookSpeed_$itemId');
+  /// Links [itemId] to [seriesId] so every book in the series shares one
+  /// playback speed - finishing a book or re-reading the series later keeps
+  /// the listener's chosen pace instead of resetting or jumping (GH #441).
+  static Future<void> noteBookSeries(String itemId, String? seriesId) async {
+    final clean = seriesId?.trim();
+    if (itemId.isEmpty || clean == null || clean.isEmpty) return;
+    if (await ScopedPrefs.getString('bookSeries_$itemId') != clean) {
+      await ScopedPrefs.setString('bookSeries_$itemId', clean);
+    }
+    if (await ScopedPrefs.getDouble('bookSpeed_series_$clean') == null) {
+      final existing = await ScopedPrefs.getDouble('bookSpeed_$itemId');
+      if (existing != null) {
+        await ScopedPrefs.setDouble('bookSpeed_series_$clean', existing);
+      }
+    }
+  }
 
-  static Future<void> setBookSpeed(String itemId, double speed) =>
-      _set('bookSpeed_$itemId', speed);
+  static Future<void> noteBookSeriesFromItem(Map<String, dynamic>? item) async {
+    final id = item?['id'] as String?;
+    if (id == null || id.isEmpty) return;
+    final media = item?['media'] as Map<String, dynamic>?;
+    final meta = media?['metadata'] as Map<String, dynamic>?;
+    final raw = meta?['series'];
+    String? seriesId;
+    if (raw is List) {
+      for (final s in raw) {
+        if (s is Map && (s['id'] as String?)?.isNotEmpty == true) {
+          seriesId = s['id'] as String;
+          break;
+        }
+      }
+    } else if (raw is Map) {
+      seriesId = raw['id'] as String?;
+    }
+    seriesId ??= item?['seriesId'] as String?;
+    await noteBookSeries(id, seriesId);
+  }
+
+  static Future<double?> getBookSpeed(String itemId) async {
+    final seriesId = await ScopedPrefs.getString('bookSeries_$itemId');
+    if (seriesId != null && seriesId.isNotEmpty) {
+      final s = await ScopedPrefs.getDouble('bookSpeed_series_$seriesId');
+      if (s != null) return s;
+    }
+    return ScopedPrefs.getDouble('bookSpeed_$itemId');
+  }
+
+  static Future<void> setBookSpeed(String itemId, double speed) async {
+    final seriesId = await ScopedPrefs.getString('bookSeries_$itemId');
+    if (seriesId != null && seriesId.isNotEmpty) {
+      await _set('bookSpeed_series_$seriesId', speed);
+      return;
+    }
+    await _set('bookSpeed_$itemId', speed);
+  }
 
   // ── Per-book sleep-rewind override (falls back to the global default) ──
 

@@ -608,6 +608,13 @@ class _BookDetailSheetContentState extends State<_BookDetailSheetContent> {
           }
 
           setState(() { _item = finalItem; _isLoading = false; });
+          PlayerSettings.noteBookSeriesFromItem(finalItem).then((_) {
+            PlayerSettings.getBookSpeed(widget.itemId).then((s) {
+              if (s != null && mounted && s != _savedSpeed) {
+                setState(() => _savedSpeed = s);
+              }
+            });
+          });
           unawaited(_probeNarration());
           _loadCoverShape();
           if (BookDockInfo.of(finalItem)?.isWorking ?? false) {

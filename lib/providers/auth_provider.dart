@@ -23,6 +23,10 @@ import '../widgets/overlay_toast.dart';
 import '../utils/server_url.dart';
 
 class AuthProvider extends ChangeNotifier {
+  AuthProvider() {
+    SocketService().tokenRefresher = ensureFreshToken;
+  }
+
   String? _accessToken;
   String? _refreshToken;
   bool _isLegacyToken = false;
@@ -396,6 +400,11 @@ class AuthProvider extends ChangeNotifier {
     );
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('wear_token_pair_pending');
+  }
+
+  Future<String?> ensureFreshToken() async {
+    await apiService?.ensureFreshAccessToken();
+    return _accessToken;
   }
 
   void _onAuthExpired(String sessionServer, String? sessionUsername) {

@@ -77,7 +77,8 @@ class _PodcastEpisodeFeedState extends State<PodcastEpisodeFeed> {
   /// episodes out, so filtering its pages for them could only ever come back
   /// empty.
   bool get _isShelfFilter =>
-      _filter == 'upnext' || _filter == 'new' || _filter == 'finished';
+      !context.read<LibraryProvider>().isOffline &&
+      (_filter == 'upnext' || _filter == 'new' || _filter == 'finished');
 
   @override
   void initState() {
@@ -110,6 +111,22 @@ class _PodcastEpisodeFeedState extends State<PodcastEpisodeFeed> {
   }
 
   Future<void> _loadPage() async {
+    final lib = context.read<LibraryProvider>();
+    if (lib.isOffline) {
+      final offline = _mapShelfEntities(
+        lib.offlinePodcastEntities(libraryId: widget.libraryId),
+      )..sort((a, b) => ((b['publishedAt'] as num?)?.toInt() ?? 0)
+          .compareTo((a['publishedAt'] as num?)?.toInt() ?? 0));
+      setState(() {
+        _episodes
+          ..clear()
+          ..addAll(offline);
+        _hasMore = false;
+        _loading = false;
+        _loadingMore = false;
+      });
+      return;
+    }
     final api = context.read<AuthProvider>().apiService;
     if (api == null) {
       setState(() {

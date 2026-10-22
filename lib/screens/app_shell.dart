@@ -117,8 +117,9 @@ class AppShell extends StatefulWidget {
     // first. Otherwise switching to the Library tab leaves the player
     // covering the filtered library underneath. Caller (e.g. the book
     // detail sheet) has already popped its own modal route at this point.
-    if (inst._expandedIsOpen && inst.mounted) {
-      Navigator.of(inst.context, rootNavigator: true).maybePop();
+    if (inst.mounted) {
+      final nav = Navigator.of(inst.context, rootNavigator: true);
+      if (nav.canPop()) nav.popUntil((r) => r.isFirst);
     }
     inst._navigateTo(1);
     // The retry budget has to survive the fade transition (~200ms by
@@ -703,6 +704,7 @@ class _AppShellState extends State<AppShell>
     HomeWidgetService().onAppForegrounded();
     ReviewService.onAppForegrounded();
     unawaited(SettingsSyncService().onAppForegrounded());
+    unawaited(ChromecastService().onAppForegrounded());
     _refreshDataForTab(_currentIndex);
     // Check auto sleep in case we resumed into the window
     SleepTimerService().checkAutoSleep();
@@ -717,6 +719,7 @@ class _AppShellState extends State<AppShell>
     AudioPlayerService.onAppBackgrounded();
     HomeWidgetService().onAppBackgrounded();
     unawaited(SettingsSyncService().onAppBackgrounded());
+    unawaited(ChromecastService().onAppBackgrounded());
   }
 
   @override

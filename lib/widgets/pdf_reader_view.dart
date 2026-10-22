@@ -9,6 +9,8 @@ import '../providers/library_provider.dart';
 import '../services/api_service.dart';
 import '../services/ebook_cache.dart';
 import '../services/progress_sync_service.dart';
+import '../services/scoped_prefs.dart';
+import '../services/screen_wake.dart';
 import '../services/volume_key_service.dart';
 
 /// Full-screen PDF reader. PDFs are fixed-layout, so this is deliberately
@@ -58,6 +60,9 @@ class _PdfReaderViewState extends State<PdfReaderView> with WidgetsBindingObserv
     _api = context.read<AuthProvider>().apiService;
     _lib = context.read<LibraryProvider>();
     _lib?.setReaderQuiet(true);
+    ScopedPrefs.getBool('ereader_keep_awake').then((v) {
+      if (mounted) ScreenWake.hold('reader', v ?? true);
+    });
     _loadInitialPage();
     _open();
     _volumeNav.attach();
@@ -82,6 +87,7 @@ class _PdfReaderViewState extends State<PdfReaderView> with WidgetsBindingObserv
 
   @override
   void dispose() {
+    ScreenWake.hold('reader', false);
     _lib?.setReaderQuiet(false);
     WidgetsBinding.instance.removeObserver(this);
     _volumeNav.detach();
