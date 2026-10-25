@@ -1268,7 +1268,7 @@ class AndroidAutoService {
     if (api == null) return [];
 
     try {
-      final results = await api.getBooksBySeries(libraryId, seriesId);
+      final results = await api.getAllBooksBySeries(libraryId, seriesId);
       return _sortBySeriesSequence(results, seriesId)
           .map((item) => _libraryItemToEntry(item, api))
           .whereType<AutoBookEntry>()
@@ -1283,7 +1283,7 @@ class AndroidAutoService {
   /// Sort raw library items by their sequence within the given series.
   /// The server's `sort=media.metadata.series.sequence` param sorts as a
   /// string, so "10" lands before "2". Books missing a sequence go last.
-  static final _leadingNumberRe = RegExp(r'^[\d.]+');
+  static final _seqNumberRe = RegExp(r'\d+(?:\.\d+)?');
   List<Map<String, dynamic>> _sortBySeriesSequence(
       List<dynamic> results, String seriesId) {
     final maps = results.whereType<Map<String, dynamic>>().toList();
@@ -1298,7 +1298,7 @@ class AndroidAutoService {
               : const <Map<String, dynamic>>[];
       for (final s in seriesList) {
         if (s['id'] != seriesId) continue;
-        final match = _leadingNumberRe
+        final match = _seqNumberRe
             .firstMatch((s['sequence'] ?? '').toString().trim());
         if (match != null) {
           final parsed = double.tryParse(match.group(0)!);
@@ -1833,7 +1833,7 @@ class AndroidAutoService {
     final api = await getApi();
     if (api == null) return [];
     try {
-      final results = await api.getBooksBySeries(libraryId, seriesId);
+      final results = await api.getAllBooksBySeries(libraryId, seriesId);
       return _sortBySeriesSequence(results, seriesId)
           .map((item) => _libraryItemToEntry(item, api))
           .whereType<AutoBookEntry>()
