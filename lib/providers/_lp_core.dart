@@ -981,6 +981,12 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           final progress = (currentTime / duration).clamp(0.0, 1.0);
           if (progress >= 0.99 && !serverFinished) continue;
           if (serverFinished) continue;
+          final localTs = (data['timestamp'] as num?)?.toInt() ?? 0;
+          final serverUpd = (_progressMap[itemId]?['lastUpdate'] as num?)?.toInt() ?? 0;
+          if (serverUpd > localTs) {
+            _localProgressOverrides.remove(itemId);
+            continue;
+          }
           _localProgressOverrides[itemId] = progress;
           if (currentTime > 0) _resetItems.remove(itemId);
         }
@@ -1039,6 +1045,7 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           if (itemId != null) {
             final key = episodeId != null ? '$itemId-$episodeId' : itemId;
             _progressMap[key] = mp;
+            unawaited(_storeNewerServerPosition(key, mp));
           }
         }
       }
@@ -1101,6 +1108,11 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
               };
             }
           }
+          final prevProgressMap = _progressMap;
+          final player = AudioPlayerService();
+          final playingKey = player.currentEpisodeId != null
+              ? '${player.currentItemId}-${player.currentEpisodeId}'
+              : player.currentItemId;
           _progressMap = {};
           for (final mp in progressList) {
             final itemId = mp['libraryItemId'] as String?;
@@ -1108,6 +1120,18 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
             if (itemId != null) {
               final key = episodeId != null ? '$itemId-$episodeId' : itemId;
               _progressMap[key] = mp;
+              if (!(key == playingKey && player.isPlaying)) {
+                unawaited(_storeNewerServerPosition(key, mp));
+              }
+            }
+          }
+          if (playingKey != null && player.hasBook && !player.isPlaying) {
+            final mp = _progressMap[playingKey];
+            final prevUpd = ((prevProgressMap[playingKey]?['lastUpdate']) as num?)?.toInt() ?? 0;
+            if (mp != null && mp['isFinished'] != true &&
+                ((mp['lastUpdate'] as num?)?.toInt() ?? 0) > prevUpd) {
+              _progressMap[playingKey] = prevProgressMap[playingKey] ?? const {};
+              _onRemoteProgressUpdated(mp);
             }
           }
           for (final entry in localFinished.entries) {
@@ -1158,6 +1182,9 @@ mixin _CoreMixin on ChangeNotifier, _StateMixin {
           _localProgressOverrides.removeWhere((key, localProgress) {
             if (pendingSyncs.contains(key)) return false;
             if (_locallyFinishedItems.contains(key)) return false;
+            final prevUpd = ((prevProgressMap[key]?['lastUpdate']) as num?)?.toInt() ?? 0;
+            final serverUpd = ((_progressMap[key]?['lastUpdate']) as num?)?.toInt() ?? 0;
+            if (serverUpd > prevUpd) return true;
             // Keep the override if local progress is ahead of server
             final serverProgress = ((_progressMap[key]?['progress'] as num?)?.toDouble()) ?? 0;
             if (localProgress > serverProgress + 0.001) return false;
