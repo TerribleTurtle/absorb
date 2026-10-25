@@ -342,6 +342,7 @@ class AbsorbingCardState extends State<AbsorbingCard> with AutomaticKeepAliveCli
   }
 
   Future<void> _loadSavedSpeed() async {
+    await PlayerSettings.noteBookSeriesFromItem(widget.item);
     final bookSpeed = await PlayerSettings.getBookSpeed(_itemId);
     final speed = bookSpeed ?? await PlayerSettings.defaultSpeedFor(libraryId: _resolveLibraryId());
     if (mounted && speed != _savedSpeed) setState(() => _savedSpeed = speed);
