@@ -19,6 +19,7 @@ import '../services/ebook_cache.dart';
 import '../services/image_epub.dart';
 import '../services/progress_sync_service.dart';
 import '../services/scoped_prefs.dart';
+import '../services/screen_wake.dart';
 import '../services/ebook_annotation_service.dart';
 import '../services/volume_key_service.dart';
 import 'ebook_router.dart' show ebookExt;
@@ -169,6 +170,9 @@ class _ComicReaderViewState extends State<ComicReaderView> with WidgetsBindingOb
     _otherAccount = DownloadService().isFromOtherAccount(widget.itemId);
     _lib = context.read<LibraryProvider>();
     _lib?.setReaderQuiet(true);
+    ScopedPrefs.getBool('ereader_keep_awake').then((v) {
+      if (mounted) ScreenWake.hold('reader', v ?? true);
+    });
     ScopedPrefs.getBool(_directionKey).then((v) {
       if (mounted && v != null) setState(() => _rtl = v);
     });
@@ -188,6 +192,7 @@ class _ComicReaderViewState extends State<ComicReaderView> with WidgetsBindingOb
 
   @override
   void dispose() {
+    ScreenWake.hold('reader', false);
     _lib?.setReaderQuiet(false);
     WidgetsBinding.instance.removeObserver(this);
     _volumeNav.detach();
@@ -225,7 +230,6 @@ class _ComicReaderViewState extends State<ComicReaderView> with WidgetsBindingOb
   }
 
   Future<void> _open() async {
-    final l = AppLocalizations.of(context)!;
     final ext = ebookExt(widget.ebookFile);
     final api = _api;
     final offline = _lib?.isOffline ?? true;
@@ -246,6 +250,7 @@ class _ComicReaderViewState extends State<ComicReaderView> with WidgetsBindingOb
         pages = await _unpack(await fetchEbookToCache(api, widget.itemId, widget.ebookFile, widget.title));
       }
       if (!mounted) return;
+      final l = AppLocalizations.of(context)!;
       if (pages == null) {
         setState(() {
           _error = ext == 'cbz' ? l.noEbookFileFound : l.comicNeedsConnection;
