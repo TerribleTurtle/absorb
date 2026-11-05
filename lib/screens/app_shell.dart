@@ -444,6 +444,10 @@ class _AppShellState extends State<AppShell>
       await Navigator.of(context, rootNavigator: true).maybePop();
       if (!mounted) return;
     }
+    if (mounted) {
+      final nav = Navigator.of(context, rootNavigator: true);
+      if (nav.canPop()) nav.popUntil((r) => r.isFirst);
+    }
     _navigateToPrepared(1);
     // The retry budget has to survive the fade transition (~200ms by
     // default, see `_fadeController` and `_navigateTo`) plus the library
