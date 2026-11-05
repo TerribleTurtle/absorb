@@ -1090,7 +1090,10 @@ class LibraryScreenState extends State<LibraryScreen>
       }
       // Restore last active tab (only for book libraries with tabs).
       const maxRestorableTab = 4;
-      if (!isPodcast && savedTab > 0 && savedTab <= maxRestorableTab) {
+      if (!_filterOverriddenByUser &&
+          !isPodcast &&
+          savedTab > 0 &&
+          savedTab <= maxRestorableTab) {
         _currentTab = savedTab;
         _tabController?.animateTo(savedTab);
       }
@@ -1102,17 +1105,17 @@ class LibraryScreenState extends State<LibraryScreen>
     });
     // Lazy load data for the restored tab
     if (!isPodcast &&
-        savedTab == 1 &&
+        _currentTab == 1 &&
         _seriesItems.isEmpty &&
         !_isLoadingSeriesPage) {
       _loadSeriesPage();
     } else if (!isPodcast &&
-        savedTab == 2 &&
+        _currentTab == 2 &&
         !_authorsLoaded &&
         !_isLoadingAuthors) {
       _loadAuthors();
     } else if (!isPodcast &&
-        savedTab == 3 &&
+        _currentTab == 3 &&
         !_narratorsLoaded &&
         !_isLoadingNarrators) {
       _loadNarrators();
