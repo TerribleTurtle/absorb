@@ -684,6 +684,9 @@ class ApiService {
       if (persisted?.refreshToken != null) {
         _refreshToken = persisted!.refreshToken;
       }
+      if (_refreshToken != null && _refreshToken == _rejectedRefreshToken) {
+        return false;
+      }
       final adopted = _accessToken != previousAccess;
       if (adopted) {
         debugPrint(
@@ -804,6 +807,11 @@ class ApiService {
     return outcome == _RefreshOutcome.refreshed;
   }
 
+  /// The most recent refresh token rejected by the server: prevents every
+  /// in-flight call from hammering /auth/refresh with the same spent token
+  /// when the server revokes or rotates a session (GH #444).
+  static String? _rejectedRefreshToken;
+
   /// Attempt to refresh the access token using the refresh token. A rejected
   /// refresh is kept distinct from a temporary network/server failure so only
   /// an explicit 401/403 can expire the local session.
@@ -830,6 +838,12 @@ class ApiService {
         _refreshCompleter!.complete(_RefreshOutcome.refreshed);
         return _RefreshOutcome.refreshed;
       }
+      if (_refreshToken != null && _refreshToken == _rejectedRefreshToken) {
+        _refreshToken = null;
+        _accessToken = '';
+        _refreshCompleter!.complete(_RefreshOutcome.rejected);
+        return _RefreshOutcome.rejected;
+      }
 
       for (var attempt = 0; attempt < 2; attempt++) {
         final refreshTokenSent = _refreshToken;
@@ -848,6 +862,7 @@ class ApiService {
             final newAccess = tokens.accessToken;
             final newRefresh = tokens.refreshToken;
             if (newAccess != null) {
+              _rejectedRefreshToken = null;
               _accessToken = newAccess;
               if (newRefresh != null) _refreshToken = newRefresh;
               await _notifyTokensRefreshed();
@@ -872,6 +887,9 @@ class ApiService {
               '(sent refresh=${tokenFp(refreshTokenSent)})'
               '${_refreshToken == refreshTokenSent ? " - storage holds the same spent token, session is dead until re-login" : ""}',
             );
+            _rejectedRefreshToken = refreshTokenSent;
+            _refreshToken = null;
+            _accessToken = '';
             _refreshCompleter!.complete(_RefreshOutcome.rejected);
             return _RefreshOutcome.rejected;
           }
@@ -933,6 +951,7 @@ class ApiService {
     _preflightCooldownUntil = null;
     _apiKeyCheckedAt = null;
     _apiKeyCheckRunning = false;
+    _rejectedRefreshToken = null;
   }
 
   /// Refresh BEFORE spending a known-expired access token, rather than firing
@@ -952,6 +971,12 @@ class ApiService {
   /// we go back to letting the request itself fail.
   Future<void> _ensureFreshAccessToken() async {
     if (_isLegacyToken || _refreshToken == null) return;
+    if (_refreshToken == _rejectedRefreshToken) {
+      if (await _refreshAccessToken() == _RefreshOutcome.rejected) {
+        onAuthExpired?.call();
+      }
+      return;
+    }
     final cooldownUntil = _preflightCooldownUntil;
     if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) return;
     final expiry = _accessTokenExpiry;
@@ -981,6 +1006,7 @@ class ApiService {
   /// captured earlier.
   Future<http.Response> _authGet(Uri url, {Map<String, String>? headers, bool sendRefreshTokenHeader = false, Duration timeout = const Duration(seconds: 15)}) async {
     await _ensureFreshAccessToken();
+    if (_accessToken.isEmpty) return http.Response('', 401);
     var h = headers ?? _headers;
     if (sendRefreshTokenHeader && _refreshToken != null) {
       h = {...h, 'x-refresh-token': _refreshToken!};
@@ -1010,6 +1036,7 @@ class ApiService {
   /// Make an authenticated POST request, retrying once on 401 with a refreshed token.
   Future<http.Response> _authPost(Uri url, {Map<String, String>? headers, Object? body, Duration timeout = const Duration(seconds: 15)}) async {
     await _ensureFreshAccessToken();
+    if (_accessToken.isEmpty) return http.Response('', 401);
     final h = headers ?? _headers;
     var response = await _post(url, headers: h, body: body).timeout(timeout);
     if (response.statusCode == 401 && !_isLegacyToken) {
@@ -1029,6 +1056,7 @@ class ApiService {
   /// Make an authenticated PATCH request, retrying once on 401 with a refreshed token.
   Future<http.Response> _authPatch(Uri url, {Map<String, String>? headers, Object? body, Duration timeout = const Duration(seconds: 15)}) async {
     await _ensureFreshAccessToken();
+    if (_accessToken.isEmpty) return http.Response('', 401);
     final h = headers ?? _headers;
     var response = await _patch(url, headers: h, body: body).timeout(timeout);
     if (response.statusCode == 401 && !_isLegacyToken) {
@@ -1048,6 +1076,7 @@ class ApiService {
   /// Make an authenticated DELETE request, retrying once on 401 with a refreshed token.
   Future<http.Response> _authDelete(Uri url, {Map<String, String>? headers, Duration timeout = const Duration(seconds: 15)}) async {
     await _ensureFreshAccessToken();
+    if (_accessToken.isEmpty) return http.Response('', 401);
     final h = headers ?? _headers;
     var response = await _delete(url, headers: h).timeout(timeout);
     if (response.statusCode == 401 && !_isLegacyToken) {
