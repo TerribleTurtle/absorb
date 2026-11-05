@@ -82,7 +82,7 @@ List<Map<String, dynamic>> buildAbsorbingList(
   // absorbing list. Online we keep Absorbing focused on started/queued items;
   // offline the user has no other way to reach unstarted downloads, so we
   // merge them in. Started ones already appear via the absorbingBookIds path.
-  if (lib.isOffline) {
+  if (lib.isOffline && !lib.isPodcastLibrary) {
     final seenKeys = items.map(absorbingKeyOf).toSet();
     for (final section in lib.personalizedSections) {
       if ((section['id'] as String?) != 'downloaded-books') continue;
