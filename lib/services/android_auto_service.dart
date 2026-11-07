@@ -300,6 +300,9 @@ class AndroidAutoService {
     _childrenCache.clear();
     _childrenInFlight.clear();
     _groupEntries.clear();
+    if (AudioPlayerService().chapters.isEmpty) {
+      AudioPlayerService.handler?.updateChaptersQueue(const []);
+    }
     debugPrint('[AutoBrowse] Cache cleared (user switch/logout)');
   }
 
@@ -588,6 +591,72 @@ class AndroidAutoService {
     _downloaded = entries;
   }
 
+  /// Merge unstarted queued books and extra podcast episodes from the local
+  /// absorbing cache into Continue, drop manually removed items, and re-sort
+  /// to match the in-app queue order without hitting the server (GH #318).
+  Future<void> _syncContinueWithAbsorbingPrefs() async {
+    final order = await ScopedPrefs.getStringList('absorbing_seen_ids');
+    final removes =
+        (await ScopedPrefs.getStringList('absorbing_manual_removes')).toSet();
+    final finishedAdds = (await ScopedPrefs.getStringList(
+            'absorbing_finished_manual_adds'))
+        .toSet();
+    final idx = <String, int>{};
+    for (var i = 0; i < order.length; i++) {
+      idx.putIfAbsent(order[i], () => i);
+    }
+    final byId = <String, AutoBookEntry>{
+      for (final e in _continueListening)
+        if (!removes.contains(e.id)) e.id: e,
+    };
+    for (final raw
+        in await ScopedPrefs.getStringList('absorbing_item_cache_v2')) {
+      try {
+        final m = jsonDecode(raw);
+        if (m is! Map<String, dynamic>) continue;
+        final prog = m['mediaProgress'] as Map<String, dynamic>?;
+        final finished = prog?['isFinished'] as bool? ?? false;
+        final entry = _entityToEntry(m);
+        if (entry == null || removes.contains(entry.id)) continue;
+        if (finished && !finishedAdds.contains(entry.id)) continue;
+        if (idx.containsKey(entry.id)) {
+          byId.putIfAbsent(entry.id, () => entry);
+        }
+      } catch (_) {}
+    }
+    final tailOrder = <String, int>{
+      for (var i = 0; i < _continueListening.length; i++)
+        _continueListening[i].id: i,
+    };
+    _continueListening = byId.values.toList()
+      ..sort((a, b) {
+        final ai = idx[a.id] ?? (1 << 30);
+        final bi = idx[b.id] ?? (1 << 30);
+        if (ai != bi) return ai.compareTo(bi);
+        return (tailOrder[a.id] ?? 0).compareTo(tailOrder[b.id] ?? 0);
+      });
+  }
+
+  Future<void> onAbsorbingQueueChanged() async {
+    _childrenCache.remove(AutoMediaIds.continueListening);
+    if (_lastRefresh != null || _continueListening.isNotEmpty) {
+      await _syncContinueWithAbsorbingPrefs();
+    }
+    if (Platform.isAndroid) {
+      // ignore: deprecated_member_use
+      unawaited(AudioServiceBackground
+          .notifyChildrenChanged(AutoMediaIds.continueListening)
+          .catchError((_) {}));
+    }
+    try {
+      onServerDataChanged?.call();
+    } catch (_) {}
+    final handler = AudioPlayerService.handler;
+    if (handler != null && AudioPlayerService().chapters.isEmpty) {
+      handler.updateChaptersQueue(const []);
+    }
+  }
+
   /// Build the Continue shelf from in-progress downloaded books when the server
   /// is unreachable, so the user can resume in Android Auto / CarPlay without
   /// digging through the Downloads tab (Discord request). Ordered to match the
@@ -601,6 +670,8 @@ class AndroidAutoService {
     }
     final psync = ProgressSyncService();
     final absorbingOrder = await ScopedPrefs.getStringList('absorbing_seen_ids');
+    final manualRemoves =
+        (await ScopedPrefs.getStringList('absorbing_manual_removes')).toSet();
     final absorbingIndex = <String, int>{};
     for (var i = 0; i < absorbingOrder.length; i++) {
       absorbingIndex.putIfAbsent(absorbingOrder[i], () => i);
@@ -610,12 +681,14 @@ class AndroidAutoService {
     // same key the absorbing list uses (bookId, or showId-episodeId).
     final ranked = <(int, int, AutoBookEntry)>[];
     for (final entry in _downloaded) {
+      if (manualRemoves.contains(entry.id)) continue;
+      final inQueue = absorbingIndex.containsKey(entry.id);
       final local = await psync.getLocal(entry.id);
-      if (local == null) continue;
-      final pos = (local['currentTime'] as num?)?.toDouble() ?? 0;
-      final finished = local['isFinished'] as bool? ?? false;
-      if (finished || pos <= 0) continue; // only books in progress
-      final ts = (local['timestamp'] as num?)?.toInt() ?? 0;
+      if (local == null && !inQueue) continue;
+      final pos = (local?['currentTime'] as num?)?.toDouble() ?? 0;
+      final finished = local?['isFinished'] as bool? ?? false;
+      if (finished || (pos <= 0 && !inQueue)) continue; // only books in progress
+      final ts = (local?['timestamp'] as num?)?.toInt() ?? 0;
       final order = absorbingIndex[entry.id] ?? (1 << 30);
       ranked.add((order, ts, entry));
     }
@@ -718,7 +791,10 @@ class AndroidAutoService {
                 final id = entity['id'] as String? ?? '';
                 final ep = entity['recentEpisode'] as Map<String, dynamic>?;
                 final key = ep != null ? '$id-${ep['id'] ?? ''}' : id;
-                if (key.isNotEmpty && continueSeenIds.add(key)) {
+                final finished = (entity['mediaProgress']
+                        as Map<String, dynamic>?)?['isFinished'] as bool? ??
+                    false;
+                if (!finished && key.isNotEmpty && continueSeenIds.add(key)) {
                   continueEntities.add(entity);
                 }
               }
@@ -781,6 +857,7 @@ class AndroidAutoService {
           .map((e) => _entityToEntry(e, api))
           .whereType<AutoBookEntry>()
           .toList();
+      await _syncContinueWithAbsorbingPrefs();
 
       recentRanked.sort((a, b) => b.$1.compareTo(a.$1));
       _recentlyAdded = recentRanked.map((e) => e.$2).toList();
@@ -806,7 +883,7 @@ class AndroidAutoService {
         .toList();
   }
 
-  AutoBookEntry? _entityToEntry(Map<String, dynamic> entity, ApiService api) {
+  AutoBookEntry? _entityToEntry(Map<String, dynamic> entity, [ApiService? api]) {
     final id = entity['id'] as String?;
     if (id == null) return null;
     // GH #361: ebook-only items can't play in a car - keep them off the
@@ -1268,7 +1345,7 @@ class AndroidAutoService {
     if (api == null) return [];
 
     try {
-      final results = await api.getBooksBySeries(libraryId, seriesId);
+      final results = await api.getAllBooksBySeries(libraryId, seriesId);
       return _sortBySeriesSequence(results, seriesId)
           .map((item) => _libraryItemToEntry(item, api))
           .whereType<AutoBookEntry>()
@@ -1283,7 +1360,7 @@ class AndroidAutoService {
   /// Sort raw library items by their sequence within the given series.
   /// The server's `sort=media.metadata.series.sequence` param sorts as a
   /// string, so "10" lands before "2". Books missing a sequence go last.
-  static final _leadingNumberRe = RegExp(r'^[\d.]+');
+  static final _seqNumberRe = RegExp(r'\d+(?:\.\d+)?');
   List<Map<String, dynamic>> _sortBySeriesSequence(
       List<dynamic> results, String seriesId) {
     final maps = results.whereType<Map<String, dynamic>>().toList();
@@ -1298,7 +1375,7 @@ class AndroidAutoService {
               : const <Map<String, dynamic>>[];
       for (final s in seriesList) {
         if (s['id'] != seriesId) continue;
-        final match = _leadingNumberRe
+        final match = _seqNumberRe
             .firstMatch((s['sequence'] ?? '').toString().trim());
         if (match != null) {
           final parsed = double.tryParse(match.group(0)!);
@@ -1833,7 +1910,7 @@ class AndroidAutoService {
     final api = await getApi();
     if (api == null) return [];
     try {
-      final results = await api.getBooksBySeries(libraryId, seriesId);
+      final results = await api.getAllBooksBySeries(libraryId, seriesId);
       return _sortBySeriesSequence(results, seriesId)
           .map((item) => _libraryItemToEntry(item, api))
           .whereType<AutoBookEntry>()

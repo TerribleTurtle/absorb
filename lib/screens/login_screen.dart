@@ -150,6 +150,8 @@ class _LoginScreenState extends State<LoginScreen>
         ? resolvedServerUrl.substring(protocol.length)
         : resolvedServerUrl;
     _usernameController.text = username;
+    _debounce?.cancel();
+    _checkServer();
   }
 
   void _setInitialHeaders(Map<String, String> headers) {
@@ -307,11 +309,10 @@ class _LoginScreenState extends State<LoginScreen>
         final check = backend.isBookOrbit
             ? OidcService.checkBookOrbitOidc(fullUrl, customHeaders: headers)
             : OidcService.checkOidcEnabled(fullUrl, customHeaders: headers);
-        check.then((config) {
-          if (mounted && _resolvedServerUrl == fullUrl && _backend == backend) {
-            setState(() => _oidcConfig = config);
-          }
-        });
+        final config = await check;
+        if (mounted && _resolvedServerUrl == fullUrl && _backend == backend) {
+          setState(() => _oidcConfig = config);
+        }
 
         // Don't auto-focus — user may still be typing IP:port
       }
@@ -363,6 +364,7 @@ class _LoginScreenState extends State<LoginScreen>
         return;
       }
     }
+    if (apiKey.isEmpty && _isOidcOnly) return;
 
     setState(() {
       _isConnecting = true;
@@ -699,9 +701,9 @@ class _LoginScreenState extends State<LoginScreen>
                                     onFieldSubmitted: (_) {
                                       if (!_serverValid && !_serverChecking) {
                                         _checkServer().then((_) {
-                                          if (mounted && _serverValid) _usernameFocus.requestFocus();
+                                          if (mounted && _serverValid && !_isOidcOnly) _usernameFocus.requestFocus();
                                         });
-                                      } else if (_serverValid) {
+                                      } else if (_serverValid && !_isOidcOnly) {
                                         _usernameFocus.requestFocus();
                                       }
                                     },
@@ -1549,6 +1551,14 @@ class _LoginScreenState extends State<LoginScreen>
     );
   }
 
+  /// Whether the server requires OIDC exclusively, hiding password inputs
+  /// so listeners on SSO servers are not confused by dead fields (GH #444).
+  bool get _isOidcOnly =>
+      _serverValid &&
+      _oidcConfig != null &&
+      _oidcConfig!.enabled &&
+      !_oidcConfig!.hasLocalAuth;
+
   Widget _buildCredentialFields(ColorScheme cs, TextTheme tt) {
     final l = AppLocalizations.of(context)!;
     final usingApiKey = _apiKeyController.text.trim().isNotEmpty;
@@ -1584,7 +1594,7 @@ class _LoginScreenState extends State<LoginScreen>
             ),
           ),
 
-        if (!usingApiKey) ...[
+        if (!usingApiKey && !_isOidcOnly) ...[
           // Username
           _buildInputField(
             controller: _usernameController,
@@ -1638,6 +1648,7 @@ class _LoginScreenState extends State<LoginScreen>
               ),
             ),
         ],
+        if (usingApiKey || !_isOidcOnly) ...[
         const SizedBox(height: 24),
 
         // Sign In button
@@ -1677,6 +1688,7 @@ class _LoginScreenState extends State<LoginScreen>
             ),
           ),
         ),
+        ],
         AnimatedSize(
           duration: const Duration(milliseconds: 350),
           curve: Curves.easeOutCubic,
