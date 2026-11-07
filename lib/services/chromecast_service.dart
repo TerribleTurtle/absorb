@@ -179,6 +179,7 @@ class ChromecastService extends ChangeNotifier {
       (session) {
         final state = GoogleCastSessionManager.instance.connectionState;
         debugPrint('[Cast] SESSION EVENT — connectionState: $state, session: ${session?.device?.friendlyName ?? "null"}');
+        if (state != GoogleCastConnectState.connected && _lastConnectedDevice == null && !_reconnecting) return;
         if (state == GoogleCastConnectState.connected) {
           // Cancel any pending disconnect wipe - we're back before the grace expired.
           if (_disconnectDebounceTimer?.isActive ?? false) {
@@ -244,9 +245,10 @@ class ChromecastService extends ChangeNotifier {
   /// device to go back to. Otherwise there's nothing to reconnect for -
   /// fall straight through to the normal wipe.
   void _beginReconnectOrWipe() {
+    if (_reconnecting) return;
     final device = _lastConnectedDevice;
     final wasEngaged =
-        _castingItemId != null && _playbackState != CastPlaybackState.idle;
+        _connectedDeviceName == null || (_castingItemId != null && _playbackState != CastPlaybackState.idle);
     if (device == null || !wasEngaged) {
       _onDisconnected();
       return;
@@ -327,6 +329,7 @@ class ChromecastService extends ChangeNotifier {
     _connectionState = CastConnectionState.disconnected;
     _playbackState = CastPlaybackState.idle;
     _connectedDeviceName = null;
+    _lastConnectedDevice = null;
     _castingItemId = _castingEpisodeId = _castingTitle = _castingAuthor = _castingCoverUrl = null;
     _castingDuration = 0;
     _castingChapters = [];
@@ -336,6 +339,8 @@ class ChromecastService extends ChangeNotifier {
     _mediaStatusSub?.cancel();
     _positionSub?.cancel();
     _syncTimer?.cancel();
+    _stallTimer?.cancel();
+    _wantPlaying = null;
     _idleDebounceTimer?.cancel();
     _disconnectDebounceTimer?.cancel();
     _reconnecting = false;
@@ -389,9 +394,27 @@ class ChromecastService extends ChangeNotifier {
     }
   }
 
+  // Some Cast speakers stay in BUFFERING while audio is playing and
+  // position advances, leaving the card on Play and freezing the sleep
+  // timer (GH #404).
+  Timer? _stallTimer;
+  bool? _wantPlaying;
+
+  void _armStallTimer() {
+    _idleDebounceTimer?.cancel();
+    _stallTimer?.cancel();
+    _stallTimer = Timer(const Duration(seconds: 4), () {
+      if (_playbackState != CastPlaybackState.playing) return;
+      _playbackState = _wantPlaying == true ? CastPlaybackState.paused : CastPlaybackState.buffering;
+      _wantPlaying = null;
+      notifyListeners();
+    });
+  }
+
   void _listenToMediaStatus() {
     _mediaStatusSub?.cancel();
     _mediaStatusSub = GoogleCastRemoteMediaClient.instance.mediaStatusStream.listen((status) {
+      if (_castingItemId == null && _castingTitle == null) return;
       final prev = _playbackState;
 
       // Queue mode: map the receiver's current item to our track index so
@@ -420,6 +443,11 @@ class ChromecastService extends ChangeNotifier {
           default: target = CastPlaybackState.idle;
         }
       }
+      if (target != (_wantPlaying == true ? CastPlaybackState.paused : CastPlaybackState.buffering)) _wantPlaying = null;
+      if (target == CastPlaybackState.paused && _wantPlaying == true) target = CastPlaybackState.playing;
+      if (target == CastPlaybackState.paused || target == CastPlaybackState.idle) _stallTimer?.cancel();
+      if (target == CastPlaybackState.buffering && _wantPlaying == false) target = CastPlaybackState.paused;
+      if (target == CastPlaybackState.buffering && (_stallTimer?.isActive ?? false)) target = CastPlaybackState.playing;
 
       // Any non-idle event means we're still live - cancel any pending idle wipe.
       if (target != CastPlaybackState.idle && (_idleDebounceTimer?.isActive ?? false)) {
@@ -500,6 +528,7 @@ class ChromecastService extends ChangeNotifier {
     _positionSub = GoogleCastRemoteMediaClient.instance.playerPositionStream?.listen((pos) {
       // ignore: unnecessary_null_comparison
       if (pos != null) {
+        final prev = _castPosition;
         // Queue and fallback modes report track-local positions; translate
         // to absolute book position.
         if (_queueOffsets != null && _queueTrackIdx >= 0 && _queueTrackIdx < _queueOffsets!.length - 1) {
@@ -510,6 +539,18 @@ class ChromecastService extends ChangeNotifier {
           _castPosition = Duration(milliseconds: offsetMs + pos.inMilliseconds);
         } else {
           _castPosition = pos;
+        }
+        if (pos == Duration.zero && _castPosition < prev && _playbackState != CastPlaybackState.playing) {
+          _castPosition = prev;
+          return;
+        }
+        if (_wantPlaying != false && _castPosition > prev && (_playbackState == CastPlaybackState.playing || _playbackState == CastPlaybackState.buffering)) {
+          _wantPlaying = null;
+          _armStallTimer();
+          if (_playbackState == CastPlaybackState.buffering) {
+            _playbackState = CastPlaybackState.playing;
+            notifyListeners();
+          }
         }
       }
     }, onError: (e) {
@@ -550,6 +591,8 @@ class ChromecastService extends ChangeNotifier {
   Future<void> connectToDevice(GoogleCastDevice device) async {
     debugPrint('[Cast] >>> connectToDevice() — ${device.friendlyName}');
     debugPrint('[Cast] Current connectionState before connect: $_connectionState');
+    _connectedDeviceName = null;
+    _lastConnectedDevice = device;
     _connectionState = CastConnectionState.connecting;
     notifyListeners();
     try {
@@ -558,30 +601,23 @@ class ChromecastService extends ChangeNotifier {
       debugPrint('[Cast] startSessionWithDevice returned (awaited)');
     } catch (e, st) {
       debugPrint('[Cast] Connect error: $e\n$st');
+      _lastConnectedDevice = null;
       _connectionState = CastConnectionState.disconnected;
       notifyListeners();
     }
   }
 
   Future<void> disconnect() async {
-    if (_castingItemId != null && _castPosition > Duration.zero) {
-      await _saveProgressLocal();
-      await _syncProgressToServer();
-    }
-    if (_playbackSessionId != null && _api != null) {
-      try { await _api!.closePlaybackSession(_playbackSessionId!); } catch (_) {}
-      _playbackSessionId = null;
-    }
+    final flush = _flushCastSession();
+    _castingItemId = null;
     // User-initiated - don't let the disconnect event this triggers attempt a
     // backstop reconnect back to the device they just chose to leave.
     _lastConnectedDevice = null;
-    _reconnecting = false;
-    _reconnectTimer?.cancel();
-    _reconnectTimer = null;
-    await _setForegroundService(false);
+    _onDisconnected();
     try {
-      await GoogleCastSessionManager.instance.endSessionAndStopCasting();
+      await GoogleCastSessionManager.instance.endSessionAndStopCasting().timeout(const Duration(milliseconds: 500), onTimeout: () => false);
     } catch (e) { debugPrint('[Cast] Disconnect error: $e'); }
+    await flush;
   }
 
   // ── Media Loading ──
@@ -617,12 +653,17 @@ class ChromecastService extends ChangeNotifier {
     _castingCoverUrl = coverUrl;
     _castingDuration = totalDuration;
     _castingChapters = chapters;
-    _playbackState = CastPlaybackState.loading;
-    notifyListeners();
 
     final localPos = await _progressSync.getSavedPosition(itemId);
     debugPrint('[Cast] Local saved position: $localPos');
     if (localPos > 0 && startTime == 0) startTime = localPos;
+    _fallbackTracks = null; _fallbackOffsets = null; _fallbackTrackIdx = -1;
+    _queueOffsets = null; _queueTrackIdx = 0;
+    _wantPlaying = null;
+    _stallTimer?.cancel();
+    _castPosition = Duration(milliseconds: (startTime * 1000).round());
+    _playbackState = CastPlaybackState.loading;
+    notifyListeners();
 
     try {
       debugPrint('[Cast] Starting playback session with server... (episodeId: $episodeId)');
@@ -643,6 +684,7 @@ class ChromecastService extends ChangeNotifier {
         final st = (sessionData['updatedAt'] as num?)?.toInt() ?? 0;
         if (st > lt && (serverPos - startTime).abs() > 1.0) startTime = serverPos;
         else if (startTime == 0 && serverPos > 0) startTime = serverPos;
+        _castPosition = Duration(milliseconds: (startTime * 1000).round());
       }
 
       // Update duration from server if we don't have it (common for podcast episodes)
@@ -721,7 +763,7 @@ class ChromecastService extends ChangeNotifier {
           contentId: fullUrl,
           streamType: CastMediaStreamType.buffered,
           contentUrl: Uri.parse(fullUrl),
-          contentType: _contentType(fullUrl),
+          contentType: _contentType(m, fullUrl),
           metadata: GoogleCastGenericMediaMetadata(
             title: title,
             subtitle: subtitle,
@@ -777,7 +819,7 @@ class ChromecastService extends ChangeNotifier {
             contentId: fullUrl,
             streamType: CastMediaStreamType.buffered,
             contentUrl: Uri.parse(fullUrl),
-            contentType: _contentType(fullUrl),
+            contentType: _contentType(m, fullUrl),
             metadata: GoogleCastGenericMediaMetadata(
               title: title,
               subtitle: '$author · Track ${i + 1} of ${tracks.length}',
@@ -837,7 +879,7 @@ class ChromecastService extends ChangeNotifier {
         contentId: fallbackUrl,
         streamType: CastMediaStreamType.buffered,
         contentUrl: Uri.parse(fallbackUrl),
-        contentType: _contentType(fallbackUrl),
+        contentType: _contentType(m, fallbackUrl),
         metadata: GoogleCastGenericMediaMetadata(
           title: title,
           subtitle: '$author · Track ${trackIdx + 1} of ${tracks.length}',
@@ -878,8 +920,10 @@ class ChromecastService extends ChangeNotifier {
     _isAdvancingTrack = false;
   }
 
-  String _contentType(String url) {
-    final l = url.toLowerCase();
+  String _contentType(Map<String, dynamic> track, String url) {
+    final m = (track['mimeType'] as String? ?? '').toLowerCase();
+    if (m.contains('mp4')) return 'audio/mp4';
+    final l = '${m.replaceAll('/', '.').replaceAll('-', '.')} ${track['contentUrl'] ?? ''} ${(track['metadata'] as Map?)?['ext'] ?? ''} $url'.toLowerCase();
     if (l.contains('.m4b') || l.contains('.m4a') || l.contains('.aac')) return 'audio/mp4';
     if (l.contains('.ogg') || l.contains('.opus')) return 'audio/ogg';
     if (l.contains('.flac')) return 'audio/flac';
@@ -936,6 +980,12 @@ class ChromecastService extends ChangeNotifier {
 
   Future<void> play() async {
     if (!isConnected) return;
+    final wasPlaying = _playbackState == CastPlaybackState.playing || _playbackState == CastPlaybackState.buffering;
+    _wantPlaying = isPlaying ? null : true;
+    _playbackState = CastPlaybackState.playing;
+    _armStallTimer();
+    if (!wasPlaying) _onPlaybackStateChangedCallback?.call(true);
+    notifyListeners();
     try { await GoogleCastRemoteMediaClient.instance.play(); } catch (_) {}
     // Reset the sync clock so the first tick after resume only counts the
     // seconds actually played since now, not the wall-clock elapsed since
@@ -944,6 +994,12 @@ class ChromecastService extends ChangeNotifier {
   }
   Future<void> pause() async {
     if (!isConnected) return;
+    final wasPlaying = _playbackState == CastPlaybackState.playing || _playbackState == CastPlaybackState.buffering;
+    _wantPlaying = wasPlaying ? false : null;
+    _stallTimer?.cancel();
+    _playbackState = CastPlaybackState.paused;
+    if (wasPlaying) _onPlaybackStateChangedCallback?.call(false);
+    notifyListeners();
     try { await GoogleCastRemoteMediaClient.instance.pause(); } catch (_) {}
     await _saveProgressLocal();
     await _syncProgressToServer();
@@ -1047,27 +1103,32 @@ class ChromecastService extends ChangeNotifier {
 
   Future<void> stopCasting() async {
     if (!isConnected) return;
-    await _saveProgressLocal();
-    await _syncProgressToServer();
-    try { await GoogleCastRemoteMediaClient.instance.stop(); } catch (_) {}
-
-
-    // Close the playback session so stats are finalized
-    if (_playbackSessionId != null && _api != null) {
-      try { await _api!.closePlaybackSession(_playbackSessionId!); } catch (_) {}
-      _playbackSessionId = null;
-    }
-
-    await _setForegroundService(false);
+    final flush = _flushCastSession();
+    unawaited(_setForegroundService(false));
     _playbackState = CastPlaybackState.idle;
     _castingItemId = _castingEpisodeId = _castingTitle = _castingAuthor = _castingCoverUrl = null;
     _castingDuration = 0; _castingChapters = [];
     _fallbackTracks = null; _fallbackOffsets = null; _fallbackTrackIdx = -1;
     _queueOffsets = null; _queueTrackIdx = 0;
+    _wantPlaying = null;
+    _stallTimer?.cancel();
     _idleDebounceTimer?.cancel();
 
     _onPlaybackStateChangedCallback?.call(false);
     notifyListeners();
+    try { await GoogleCastRemoteMediaClient.instance.stop(); } catch (_) {}
+    await flush;
+  }
+
+  Future<void> _flushCastSession() async {
+    final sid = _playbackSessionId;
+    final sync = Future.wait([_saveProgressLocal(), _syncProgressToServer()]);
+    _playbackSessionId = null;
+    await sync;
+    // Close the playback session so stats are finalized
+    if (sid != null && _api != null) {
+      try { await _api!.closePlaybackSession(sid); } catch (_) {}
+    }
   }
 
   // ── Completion ──
@@ -1222,6 +1283,7 @@ class ChromecastService extends ChangeNotifier {
     _mediaStatusSub?.cancel();
     _positionSub?.cancel();
     _syncTimer?.cancel();
+    _stallTimer?.cancel();
     _idleDebounceTimer?.cancel();
     _disconnectDebounceTimer?.cancel();
     _reconnectTimer?.cancel();
