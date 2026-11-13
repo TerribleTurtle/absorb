@@ -444,6 +444,10 @@ class _AppShellState extends State<AppShell>
       await Navigator.of(context, rootNavigator: true).maybePop();
       if (!mounted) return;
     }
+    if (mounted) {
+      final nav = Navigator.of(context, rootNavigator: true);
+      if (nav.canPop()) nav.popUntil((r) => r.isFirst);
+    }
     _navigateToPrepared(1);
     // The retry budget has to survive the fade transition (~200ms by
     // default, see `_fadeController` and `_navigateTo`) plus the library
@@ -981,6 +985,7 @@ class _AppShellState extends State<AppShell>
       ReviewService.onAppForegrounded();
     }
     unawaited(SettingsSyncService().onAppForegrounded());
+    unawaited(ChromecastService().onAppForegrounded());
     _refreshDataForTab(_currentIndex);
     // Check auto sleep in case we resumed into the window
     SleepTimerService().checkAutoSleep();
@@ -997,6 +1002,7 @@ class _AppShellState extends State<AppShell>
     AudioPlayerService.onAppBackgrounded();
     if (!AppPlatform.lacksPhonePlugins) HomeWidgetService().onAppBackgrounded();
     unawaited(SettingsSyncService().onAppBackgrounded());
+    unawaited(ChromecastService().onAppBackgrounded());
   }
 
   @override

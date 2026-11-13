@@ -1,0 +1,169 @@
+name: Absorb Dev OTA
+
+# Builds the signed `dev` flavor APK (`com.barnabas.absorb.dev`, "Absorb Dev")
+# for arm64-v8a (Pixel 10 Pro XL / Pixel 6 Pro) from the synthesized `dev-ota`
+# branch (which mirrors local `main`'s exact tree on top of `upstream/main`
+# without pushing unsubmitted branch commit objects or triggering upstream
+# issue cross-references) and publishes a GitHub Release for Obtainium.
+
+on:
+  push:
+    branches:
+      - dev-ota
+  workflow_dispatch:
+
+concurrency:
+  group: dev-ota-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dev-ota:
+    name: Build Absorb Dev APK (arm64-v8a) & Publish OTA Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: "gradle"
+
+      - name: Read .flutter-version
+        id: flutter-ver
+        run: echo "version=$(tr -d '[:space:]' < .flutter-version 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.flutter-ver.outputs.version }}
+          cache: true
+
+      - name: Compute Obtainium OTA version and release notes
+        id: meta
+        run: |
+          RAW=$(grep '^version:' pubspec.yaml | sed 's/version: *//' | tr -d '\r')
+          PUBSPEC_VERSION="${RAW%%+*}"
+          PUBSPEC_BUILD="${RAW##*+}"
+          echo "$PUBSPEC_BUILD" | grep -Eq '^[0-9]+$' || PUBSPEC_BUILD=0
+
+          UPSTREAM_URL="https://github.com/pounat/absorb.git"
+          RAW_TAG=$(git ls-remote --tags --refs "$UPSTREAM_URL" 2>/dev/null | awk '{print $2}' | sed 's|^refs/tags/||' | grep -E '^[vV]?([0-9]+\.[0-9]+\.[0-9]+)(-[0-9]+)?$' | sort -V | tail -n 1 || true)
+          VERSION_NAME=""
+          if [ -n "$RAW_TAG" ]; then
+            VERSION_NAME=$(echo "$RAW_TAG" | sed -E 's/^[vV]?([0-9]+\.[0-9]+\.[0-9]+)(-[0-9]+)?$/\1/')
+          fi
+
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME="$PUBSPEC_VERSION"
+          fi
+          [ -z "$VERSION_NAME" ] && VERSION_NAME="0.0.0"
+
+          BUILD_NUMBER=$((PUBSPEC_BUILD * 1000 + GITHUB_RUN_NUMBER))
+          BUILD_NAME="${VERSION_NAME}-dev.${GITHUB_RUN_NUMBER}"
+          TAG="v${BUILD_NAME}"
+          COMMIT_MSG=$(git log -1 --format='%B' HEAD)
+          UPSTREAM_SHA=$(git rev-parse --short=8 HEAD^1 2>/dev/null || git rev-parse --short=8 HEAD)
+
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "build_name=${BUILD_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Companion community build of Nathan Poulson's [**Absorb**](https://github.com/pounat/absorb) (\`v${VERSION_NAME}\` @ \`${UPSTREAM_SHA}\`) with all current bug fixes and quality-of-life enhancements merged in for daily use. Installs alongside the official app as **Absorb Dev** (\`com.barnabas.absorb.dev\`). See [**FIXES.md**](https://github.com/TerribleTurtle/absorb/blob/dev-ota/FIXES.md) for the full list of included fixes and branches."
+            echo ""
+            echo "**Copying settings & keeping progress in sync:** In the main Absorb app, go to **Settings -> Backup & Restore -> Back up** (**Yes, include accounts**), then tap **Import** on the Absorb Dev sign-in screen. Once imported, **log out or Force Stop whichever app you aren't actively using** so two clients signed into the same account on one phone don't compete over Bluetooth / Android Auto play events or overwrite your server progress with an older cached position."
+            echo ""
+            echo "$COMMIT_MSG" | tail -n +2
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Set up Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/absorb-upload-key.jks"
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=$RUNNER_TEMP/absorb-upload-key.jks
+          EOF
+
+      - name: Build Absorb Dev arm64-v8a release APK
+        env:
+          BUILD_NAME: ${{ steps.meta.outputs.build_name }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+        run: |
+          flutter build apk \
+            --release \
+            --flavor dev \
+            --build-name="$BUILD_NAME" \
+            --build-number="$BUILD_NUMBER" \
+            --target-platform android-arm64 \
+            --split-per-abi
+
+      - name: Publish GitHub Release for Obtainium OTA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+        run: |
+          shopt -s nullglob
+          APKS=(build/app/outputs/apk/dev/release/*-dev-arm64-v8a.apk)
+          if [ "${#APKS[@]}" -ne 1 ]; then
+            echo "Expected 1 arm64-v8a dev APK, found ${#APKS[@]}"
+            ls -la build/app/outputs/apk/dev/release/ || true
+            exit 1
+          fi
+          APK="${APKS[0]}"
+          echo "Publishing $APK to release $TAG..."
+
+          if gh release view "$TAG" &>/dev/null; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --title "Absorb Dev ${TAG}" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --latest
+          fi
+
+          # Prune stale v*-dev.* GitHub releases (semver prefix != v${VERSION_NAME}-dev. or beyond 5 newest)
+          PREFIX="v${VERSION_NAME}-dev."
+          ALL_DEV_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null | grep -E '^v.*-dev\.[0-9]+$' || true)
+          KEPT_COUNT=0
+          for rtag in $ALL_DEV_RELEASES; do
+            case "$rtag" in
+              "$PREFIX"*)
+                KEPT_COUNT=$((KEPT_COUNT + 1))
+                if [ "$KEPT_COUNT" -gt 5 ]; then
+                  echo "Pruning excess dev OTA release (>5): $rtag"
+                  gh release delete "$rtag" --cleanup-tag --yes || true
+                fi
+                ;;
+              *)
+                echo "Pruning stale dev OTA release (semver mismatch != $PREFIX): $rtag"
+                gh release delete "$rtag" --cleanup-tag --yes || true
+                ;;
+            esac
+          done
+
+          # Prune orphaned remote refs/tags/v*-dev.* tags
+          SURVIVING_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || true)
+          REMOTE_DEV_TAGS=$(git ls-remote --tags --refs origin 'refs/tags/v*-dev.*' 2>/dev/null | awk '{print $2}' | sed 's|^refs/tags/||' || true)
+          for rtag in $REMOTE_DEV_TAGS; do
+            if ! echo "$SURVIVING_RELEASES" | grep -qx "$rtag"; then
+              echo "Pruning orphaned remote tag: $rtag"
+              git push origin --delete "refs/tags/$rtag" || true
+            fi
+          done

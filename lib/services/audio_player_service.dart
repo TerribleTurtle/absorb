@@ -473,6 +473,16 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
   int? _safeCurrentChapterIndex() {
     try {
       if (_service == null) return null;
+      if (_service!.chapters.isEmpty) {
+        final itemId = _service!.currentItemId;
+        if (itemId == null || queue.value.isEmpty) return null;
+        final epId = _service!.currentEpisodeId;
+        final mediaId = AutoMediaIds.itemId(
+          epId != null ? '$itemId-$epId' : itemId,
+        );
+        final idx = queue.value.indexWhere((m) => m.id == mediaId);
+        return idx >= 0 ? idx : null;
+      }
       final posSec = _player.position.inMilliseconds / 1000.0;
       return ChapterLookup.indexAt(
         _service!.chapters,
@@ -1120,12 +1130,37 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
 
   // ─── Chapter queue (for Android Auto queue button) ─────────────────
 
+  /// Refresh the MediaSession queue from [AndroidAutoService.continueListening]
+  /// when no chapter list is active, without triggering a prefs reload.
+  void syncAbsorbingQueue() {
+    final hasBook = _service?.hasBook ?? false;
+    if (hasBook && _service!.chapters.isNotEmpty) return;
+    queue.add(
+      hasBook
+          ? _autoService.continueListening
+              .map((e) => e.toMediaItem())
+              .toList()
+          : const [],
+    );
+    refreshPlaybackState();
+  }
+
   /// Populate the MediaSession queue with chapter entries so AA shows
   /// a chapter list via the queue button on the Now Playing screen.
   void updateChaptersQueue(List<dynamic> chapters) {
     if (chapters.isEmpty) {
-      queue.add(const []);
+      // Podcast episodes and chapterless books have no chapter list: show the
+      // absorbing queue in the Now Playing queue drawer while playing so the
+      // driver can jump to another queued episode (GH #318).
+      if ((_service?.hasBook ?? false) &&
+          _autoService.continueListening.isEmpty) {
+        unawaited(_autoService.onAbsorbingQueueChanged());
+      }
+      syncAbsorbingQueue();
       return;
+    }
+    if (_service?.hasBook ?? false) {
+      _service!._chapters = chapters;
     }
     final items = chapters.asMap().entries.map((e) {
       final ch = e.value as Map<String, dynamic>;
@@ -1138,11 +1173,18 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
       );
     }).toList();
     queue.add(items);
+    refreshPlaybackState();
   }
 
   @override
   Future<void> skipToQueueItem(int index) async {
     debugPrint('[Handler] skipToQueueItem($index)');
+    if (index >= 0 &&
+        index < queue.value.length &&
+        queue.value[index].id.startsWith(AutoMediaIds.itemPrefix)) {
+      await _playFromAutoMediaId(queue.value[index].id);
+      return;
+    }
     if (_service == null) return;
     final chapters = _service!.chapters;
     if (index < 0 || index >= chapters.length) return;
@@ -1320,7 +1362,12 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
                 id: absId,
                 title: ep['title'] as String? ?? 'Episode',
                 author: metadata['title'] as String? ?? '', // show name
-                duration: (ep['duration'] as num?)?.toDouble() ?? 0,
+                duration:
+                    (ep['duration'] as num?)?.toDouble() ??
+                    ((ep['audioFile'] as Map<String, dynamic>?)?['duration']
+                            as num?)
+                        ?.toDouble() ??
+                    0,
                 coverUrl: AndroidAutoService.localCoverUri(apiItemId),
                 chapters: ep['chapters'] as List<dynamic>? ?? [],
                 episodeId: episodeId,
@@ -2906,6 +2953,8 @@ class AudioPlayerService extends ChangeNotifier {
       if (_player == null) return;
     }
     _lastSeekTargetSec = absoluteSeconds;
+    // Paused seeks don't tick positionStream; update now so a stream retry doesn't jump back.
+    _lastKnownPositionSec = absoluteSeconds;
     _lastSeekAt = DateTime.now();
 
     // A seek already interrupts audio, so if a fresh session is waiting this
@@ -6068,6 +6117,8 @@ class AudioPlayerService extends ChangeNotifier {
     _trackStartOffsets = [];
     _currentTrackIndex = 0;
     _lastNotifiedChapterIndex = -1;
+    _chapters = [];
+    _handler?.updateChaptersQueue(const []);
     _lastSeekTargetSeconds = null;
     _lastSeekTime = null;
     _lastIndexAdvanceTime = null;
@@ -6654,14 +6705,14 @@ class AudioPlayerService extends ChangeNotifier {
 
         // Save locally every 5 seconds (always works, even offline)
         if (sec % 5 == 0 && sec != _lastSyncSecond && _currentItemId != null) {
-          _lastSyncSecond = sec;
-          _saveProgressLocal(absolutePos);
           // Seeks emit position events while paused too (auto-rewind on
           // resume, scrubbing), and such a tick must not accrue or sync -
           // the clocks are stale from the pause, so it would credit the
           // paused span as listening. The pause handler already banked the
           // playing tail.
           if (_player?.playing != true) return;
+          _lastSyncSecond = sec;
+          _saveProgressLocal(absolutePos);
           // Bank listening to durable storage every tick, decoupled from the
           // server push below, so an abrupt kill loses at most one tick.
           await _accrueListening(absolutePos);
@@ -7014,6 +7065,7 @@ class AudioPlayerService extends ChangeNotifier {
       _bgSaveTimer?.cancel();
       _bgSaveTimer = null;
       await _player?.stop();
+      _onPlaybackStateChangedCallback?.call(false);
       await _saveProgressLocal(
         Duration(milliseconds: (_lastKnownPositionSec * 1000).round()),
       );
@@ -7137,6 +7189,7 @@ class AudioPlayerService extends ChangeNotifier {
     }
 
     // Clear state (player already stopped at top of method)
+    _onPlaybackStateChangedCallback?.call(false);
     _clearState();
     _chapters = [];
     _handler?.updateChaptersQueue(const []);
@@ -7353,6 +7406,7 @@ class AudioPlayerService extends ChangeNotifier {
       );
     }
     if (ok) {
+      if (streamKey != null) unawaited(_progressSync.clearPendingSync(streamKey));
       _logEvent(PlaybackEventType.syncServer, detail: '+${elapsed}s');
     }
     if (!ok && !_syncRecoveryInProgress) {
@@ -7934,7 +7988,7 @@ class AudioPlayerService extends ChangeNotifier {
       // Timestamp gate, like the sync path: our own pre-rewind position still
       // sits on the server after a resume, so position alone would call every
       // auto-rewind "server ahead".
-      final ahead = serverTs > localTs && serverPos > localPos + 5.0;
+      final ahead = serverTs > localTs && (serverPos - localPos).abs() > 5.0;
       debugPrint(
         '[Player] Resume server-check (pre-start): server=${serverPos}s(ts=$serverTs) vs local=${localPos}s(ts=$localTs) -> ${ahead ? "SEEKING" : "keep local"}',
       );
@@ -8500,6 +8554,7 @@ class AudioPlayerService extends ChangeNotifier {
       await LocalSessionService().finalizeActive();
     }
     await _player?.stop();
+    _onPlaybackStateChangedCallback?.call(false);
     _clearState();
     _chapters = [];
     _handler?.updateChaptersQueue(const []);
