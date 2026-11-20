@@ -81,6 +81,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         'absorbing_seen_ids', _absorbingBookIds.toList());
     await ScopedPrefs.setStringList('absorbing_item_cache_v2',
         _absorbingItemCache.values.map((e) => jsonEncode(e)).toList());
+    await AndroidAutoService().onAbsorbingQueueChanged();
   }
 
   void _pruneRemotelyFinishedBooks(Iterable<String> keys) {
@@ -90,12 +91,11 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         ? '${player.currentItemId}-${player.currentEpisodeId}'
         : player.currentItemId;
     for (final key in keys) {
-      if (key.length > 36 ||
-          shouldIncludeBookInAbsorbing(
-            isFinished: (this as LibraryProvider).isItemFinishedByKey(key),
-            addedAfterFinish: _finishedManualAbsorbAdds.contains(key),
-            isActive: player.hasBook && key == activeKey,
-          )) {
+      if (shouldIncludeBookInAbsorbing(
+        isFinished: (this as LibraryProvider).isItemFinishedByKey(key),
+        addedAfterFinish: _finishedManualAbsorbAdds.contains(key),
+        isActive: player.hasBook && key == activeKey,
+      )) {
         continue;
       }
       changed = _absorbingBookIds.remove(key) || changed;
@@ -139,6 +139,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
               final episodeId = recentEpisode['id'] as String?;
               if (episodeId != null) {
                 final key = '$itemId-$episodeId';
+                if (!shouldIncludeBook(key)) continue;
                 // Downloads are shared across accounts on disk; don't auto-add
                 // them to this account's absorbing list unless this account has
                 // played them or manually added them.
@@ -293,10 +294,10 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
 
     final toRemove = <String>[];
     for (final key in _absorbingBookIds) {
-      if (key.length <= 36 &&
-          (!shouldIncludeBook(key) ||
-              (_isEbookOnlyEntry(_absorbingItemCache[key]) &&
-                  !(player.hasBook && key == activeKey)))) {
+      if (!shouldIncludeBook(key) ||
+          (key.length <= 36 &&
+              _isEbookOnlyEntry(_absorbingItemCache[key]) &&
+              !(player.hasBook && key == activeKey))) {
         toRemove.add(key);
         continue;
       }
@@ -320,8 +321,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     for (final id in toRemove) {
       _absorbingBookIds.remove(id);
       _absorbingItemCache.remove(id);
-      if (id.length <= 36 &&
-          (this as LibraryProvider).isItemFinishedByKey(id) &&
+      if ((this as LibraryProvider).isItemFinishedByKey(id) &&
           !_finishedManualAbsorbAdds.contains(id)) {
         _manualAbsorbAdds.remove(id);
       }
@@ -536,6 +536,24 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
           : null,
       episodeDuration: startingEpisode && duration > 0 ? duration : null,
     );
+    if (key.length <= 36) {
+      var data = _itemDataWithSeries(key);
+      if (data == null && _api != null && !isOffline) {
+        data = await _api!.getLibraryItem(key);
+      }
+      final (sid, _) =
+          data != null ? _StateMixin._extractSeries(data) : (null, null);
+      if (sid != null) {
+        for (final otherId in _absorbingBookIds) {
+          if (otherId == key || otherId.length > 36) continue;
+          final other = _itemDataWithSeries(otherId);
+          if (other != null && _StateMixin._extractSeries(other).$1 == sid) {
+            await PlayerSettings.noteBookSeries(otherId, sid);
+          }
+        }
+        await PlayerSettings.noteBookSeries(key, sid);
+      }
+    }
     if (!wasFinished) return;
 
     try {
@@ -970,6 +988,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         final epId = key.substring(37);
         final ep = cached['recentEpisode'] as Map<String, dynamic>?;
         final epDuration = (ep?['duration'] as num?)?.toDouble() ??
+            ((ep?['audioFile'] as Map<String, dynamic>?)?['duration'] as num?)?.toDouble() ??
             (media['duration'] as num?)?.toDouble() ??
             0;
         AudioPlayerService().playItem(
@@ -979,7 +998,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
           author: author,
           coverUrl: getCoverUrl(showId),
           totalDuration: epDuration,
-          chapters: [],
+          chapters: ep?['chapters'] as List<dynamic>? ?? [],
           episodeId: epId,
           episodeTitle: ep?['title'] as String?,
           libraryId: cached['libraryId'] as String?,
@@ -1126,6 +1145,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
     final nextKey = next.key;
 
     final mode = await PlayerSettings.getBookQueueMode();
+    await PlayerSettings.noteBookSeries(finishedBookId, seriesId);
+    await PlayerSettings.noteBookSeries(nextKey, seriesId);
     if (mode == 'auto_next') {
       _absorbingIdsAdd(nextKey, afterKey: finishedBookId);
     } else {
@@ -1164,7 +1185,7 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
   }
 
   void _autoAdvanceOfflineBook(String finishedBookId) {
-    PlayerSettings.getBookQueueMode().then((mode) {
+    PlayerSettings.getBookQueueMode().then((mode) async {
       // Alpha: bail-reason logs for GH #186 (book restart). Each silent return
       // here was a suspect in the advance-didn't-fire hypothesis.
       if (mode != 'auto_next') {
@@ -1213,6 +1234,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
       debugPrint('[AutoAdvance] Offline: playing downloaded $nextKey (seq ${nextSeq.first}) '
           'after $finishedBookId, candidates ${nextSeq.take(5).join(', ')}');
 
+      await PlayerSettings.noteBookSeries(finishedBookId, seriesId);
+      await PlayerSettings.noteBookSeries(nextKey, seriesId);
       _absorbingIdsAdd(nextKey, afterKey: finishedBookId);
       _absorbingItemCache[nextKey] = nextData;
       _manualAbsorbRemoves.remove(nextKey);
@@ -1256,7 +1279,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         if (ep == null) continue;
         final epId = ep['id'] as String?;
         if (epId == null) continue;
-        final publishedAt = (ep['publishedAt'] as num?)?.toInt() ?? 0;
+        final publishedAt = (ep['publishedAt'] as num?)?.toInt();
+        if (publishedAt == null) continue;
 
         if (epId == finishedEpId) {
           finishedTimestamp = publishedAt;
@@ -2045,9 +2069,14 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
   // ── Public fetch helpers for sheets ─────────────────────────────────
 
   Future<Map<String, dynamic>?> fetchLibraryItem(String itemId) async {
-    if (_api == null) return null;
     final id = itemId.length > 36 ? itemId.substring(0, 36) : itemId;
-    return _api!.getLibraryItem(id);
+    if (_api != null && !(this as LibraryProvider).isOffline) {
+      final item = await _api!.getLibraryItem(id);
+      if (item != null) return item;
+    }
+    return offlinePodcastEntities(
+      items: DownloadService().downloadedItems.where((dl) => dl.itemId.startsWith('$id-')),
+    ).firstOrNull;
   }
 
   Future<List<Map<String, dynamic>>> fetchBooksBySeries(
@@ -2174,14 +2203,17 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
               '')
           : (metadata['title'] as String? ?? '');
       final author = metadata['authorName'] as String? ?? '';
+      final ep = cached['recentEpisode'] as Map<String, dynamic>?;
       final duration = candidateIsPodcast
-          ? (((cached['recentEpisode'] as Map<String, dynamic>?)?['duration']
-                          as num?)
-                      ?.toDouble() ??
-                  (media['duration'] as num?)?.toDouble() ??
-                  0)
+          ? ((ep?['duration'] as num?)?.toDouble() ??
+              ((ep?['audioFile'] as Map<String, dynamic>?)?['duration'] as num?)
+                  ?.toDouble() ??
+              (media['duration'] as num?)?.toDouble() ??
+              0)
           : ((media['duration'] as num?)?.toDouble() ?? 0);
-      final chapters = (media['chapters'] as List<dynamic>?) ?? const [];
+      final chapters = candidateIsPodcast
+          ? (ep?['chapters'] as List<dynamic>? ?? const [])
+          : (media['chapters'] as List<dynamic>? ?? const []);
       return {
         'itemId': itemIdRaw,
         'episodeId': episodeIdRaw,
@@ -2420,8 +2452,8 @@ mixin _AbsorbingMixin on ChangeNotifier, _StateMixin, _CoreMixin {
         as List<dynamic>?;
     if (cachedEps != null && cachedEps.isNotEmpty) {
       eps = cachedEps;
-    } else if (_api != null) {
-      final fullItem = await _api!.getLibraryItem(showId);
+    } else {
+      final fullItem = await fetchLibraryItem(showId);
       final media = fullItem?['media'] as Map<String, dynamic>? ?? const {};
       eps = media['episodes'] as List<dynamic>? ?? const [];
     }

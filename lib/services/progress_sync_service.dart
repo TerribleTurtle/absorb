@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'api_service.dart';
 import 'download_service.dart';
+import 'home_widget_service.dart';
 import 'scoped_prefs.dart';
 import 'sync_logic.dart';
 
@@ -122,6 +123,14 @@ class ProgressSyncService {
       'timestamp': 0,
     };
     await ScopedPrefs.setString('progress_$itemId', jsonEncode(data));
+    if (pendingList.remove(itemId)) {
+      await ScopedPrefs.setStringList('pending_syncs', pendingList);
+    }
+    // Clear the widget stash so the next start can't resurrect an older position over a server rewind.
+    await HomeWidgetService().clearStashedNowPlayingPosition(
+      itemId.length > 36 ? itemId.substring(0, 36) : itemId,
+      itemId.length > 36 ? itemId.substring(37) : null,
+    );
     return true;
   }
 
@@ -153,6 +162,13 @@ class ProgressSyncService {
   Future<bool> hasPendingSync(String itemId) async {
     final pendingList = await ScopedPrefs.getStringList('pending_syncs');
     return pendingList.contains(itemId);
+  }
+
+  Future<void> clearPendingSync(String itemId) async {
+    final pendingList = await ScopedPrefs.getStringList('pending_syncs');
+    if (pendingList.remove(itemId)) {
+      await ScopedPrefs.setStringList('pending_syncs', pendingList);
+    }
   }
 
   /// Delete locally saved progress for an item.
