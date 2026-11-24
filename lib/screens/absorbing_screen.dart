@@ -1242,7 +1242,7 @@ class _AbsorbingScreenState extends State<AbsorbingScreen> {
                               ),
                             )
                           : books.isEmpty
-                          ? _emptyState(cs, tt, effectiveOffline, l)
+                          ? _emptyState(cs, tt, effectiveOffline && lib.personalizedSections.isEmpty, l)
                           : books.length == 1
                           ? LayoutBuilder(
                               builder: (context, constraints) {
